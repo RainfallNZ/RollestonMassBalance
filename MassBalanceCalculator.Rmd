@@ -1,0 +1,650 @@
+---
+title: "Mass Balance Calculator"
+output: html_notebook
+---
+
+This notebook has been prepared to enable calculation of the mass balance of the Rolleston glacier.
+Snow depth measurements are collected at the end of each winter, as well as a snow density profile.
+At the end of summer more snow depth measurements are made, and another snow density profile. In addition, the  total depth of summer melt at four locations is found.
+From these observations, together with glacier extent and elevation data the mass balance values are found.
+The mass balance values required (for submission to the World Glacier Monitoring Service) are:
+Dates of the beginning of the survey period, the end of winter observation date, and the end-of-survey date.
+The equilibrium line elevation and uncertainty
+The minimum number of observations in the accumulation area for all surveys undertaken during the year
+The maximum number of observations in the ablation area for all surveys undertaken during the year
+The size of the accumulation area and uncertainty
+The size of the ablation area and uncertainty
+Accumulation area ratio
+Specific winter balance and uncertainty
+Specific summer balance and uncertainty
+Specific annual balance and uncertainty
+Location and mass balance of each observation (with uncertainty) for all probe and stake locations
+
+The most calculations required are for the:
+1/ snow density extrapolation to all depths
+2/ The specific mass balances (which requires interpolation of the observations).
+
+Stuff to do:
+I need to add another field to the stake data that provides an identifier.
+Currently I decide on which stakes are the same by their location, but sometimes the GPS error is enough that I get a mix up
+
+Loadlibraries
+```{r}
+suppressPackageStartupMessages({
+#if (!require(maptools)) install.packages('maptools'); library(maptools)
+if (!require(sp)) install.packages('sp'); library(sp)
+  if (!require(dplyr)) install.packages('dplyr'); library(dplyr)
+  if (!require(ggplot2)) install.packages('ggplot2'); library(ggplot2)
+  if (!require(scales)) install.packages('scales'); library(scales)
+  if (!require(plotKML)) install.packages('plotKML'); library(plotKML)
+  if (!require(sf)) install.packages('sf'); library(sf)
+  if (!require(SDraw)) install.packages('SDraw'); library(SDraw)
+  if (!require(gstat)) install.packages('gstat'); library(gstat)
+  if (!require(automap)) install.packages('automap'); library(automap)
+#if (!require(rgdal)) install.packages('rgdal'); library(rgdal)
+#if (!require(raster)) install.packages('raster'); library(raster)
+if (!require(GISTools)) install.packages('GISTools'); library(GISTools)
+if (!require(RANN)) install.packages('RANN'); library(RANN)
+if (!require(tools)) install.packages('tools'); library(tools)
+  if (!require(mapview)) install.packages('mapview'); library(mapview)
+})
+```
+
+Define some useful functions and stuff
+```{r}
+#See this link to explain what the setAs is all about. I use it to predefine the date format in the StakeData.csv file I load later on. https://stackoverflow.com/questions/13022299/specify-custom-date-format-for-colclasses-argument-in-read-table-read-csv
+setAs("character","myDate", function(from) as.Date(from, format="%d/%m/%Y") )
+
+
+#The following is a function to create a depth to average density look-up-table based on some snow pit data.
+#Create a table of densities that extrapolates the observed depths down to 20 m  (which is assumed to be a maximum, who is going to probe a 20 m hole?) in 10 cm steps. The densities below the pit depth are taken as the average of the metre above.
+#Also calculate the average density for each total depth (i.e. from the surface to the depth).
+DepthToDensityLUT <- function(SinglePitData) {
+  
+  #Get the data of interest
+  Densities <- SinglePitData[,c(3:9)]
+  
+  #Create a vector of depths from 0 to 20 m
+  Depths <- seq(from = 0, to = 20000, by = 100)
+  
+  #For the special case where only a single density observation is taken, all snow densities are the same
+  if (nrow(Densities) == 1){
+    DepthDensities <- data.frame(Depths=Depths,Density=rep(Densities$Density..kg.m3.,length(Depths)))
+  } else {
+    #The usual case where several density measurements have been taken to different depths
+    DepthDensities <- approx(x=Densities$Depth.to.bottom..mm., 
+                             y=Densities$Density..kg.m3., xout = Depths, rule = 2:1)
+    
+    #Convert to a dataframe
+    DepthDensities <- as.data.frame(do.call(cbind, DepthDensities))
+    names(DepthDensities) <- c("Depth","Density")
+    
+    #Extend the densities down to 20 m assuming each 100 mm deeper has a density that is the average of the metre above
+    for (Depth in Depths[which(Depths > max(Densities$Depth.to.bottom..mm.))]) {
+      #browser()
+      DepthDensities[DepthDensities$Depth == Depth,'Density'] <- mean(DepthDensities[(DepthDensities$Depth > (Depth - 1000) & DepthDensities$Depth < Depth),'Density'])
+    }
+  }
+  #Round the density values
+  DepthDensities$Density <- round(DepthDensities$Density)
+  
+  #Calculate the average density from the surface to each depth value
+  DepthDensities$AveDensity <- sapply(DepthDensities$Depth, function(x) {mean(DepthDensities$Density[DepthDensities$Depth <= x])})
+  return(DepthDensities)
+  }
+
+
+#This function takes a snow depth and a date and the list of snow pit density data and calculates the SWE
+SnowDepthToSWE <- function(SnowDepth, Date, PitData) {
+  #browser()
+  #Get the PitData index for the date of interest
+  PitDataIndex <- which(sapply(PitData, function(x) x$Date[1] == Date)==TRUE)
+  
+  #Create the Depth-to-Density look up table from the PitData
+  DepthToDensity <- DepthToDensityLUT(PitData[[PitDataIndex]])
+  
+  #Get the average density for the depth of interest
+  AverageDensity <- approx(DepthToDensity$Depth, DepthToDensity$AveDensity, xout = SnowDepth)$y
+  SWE <- SnowDepth / 1000 * AverageDensity
+}
+```
+Start by describing the various data sources:
+Set the observation date of interest
+Observation data
+Map data
+Spatial data
+```{r}
+
+#ProjectDirectory <- "/media/drizzle/70DAC0494B655316/Projects/Rolleston Glacier/RollMassBal"
+ProjectDirectory <- "D:\\Projects\\Rolleston Glacier\\RollMassBal"
+DataDirectory <- file.path(ProjectDirectory,"data")
+GISDirectory <- file.path(ProjectDirectory,"GIS")
+
+IceDensity <- 917 #kilograms per cubic metre, from Patterson 
+#****************************************
+#Edit the date
+#Define the mass balance year. This is the year of the end-of-summer
+MassBalanceYear <- 2024
+
+#Search the data directories for the appropriate data files.
+#Currently all stake data are saved to a single file, whereas the probe and density data are saved in their own files for each survey under a directory named for the survey. 
+CurrentYearDataDirectory <- file.path(DataDirectory,"IndividualYears",paste0(MassBalanceYear -1,"-",MassBalanceYear))
+
+DepthFileNameList <- list.files(path = CurrentYearDataDirectory, pattern = "Rolleston_depths_.*csv$",full.names=TRUE)
+DensityFileNameList <- list.files(path = CurrentYearDataDirectory, pattern = "Rolleston_density_.*csv$",full.names = TRUE)
+
+RollestonGlacierOutlineFile <- "Rolleston_outline_20220408_Sentinel2_NDSI.shp"
+StakeFileName       <- file.path(DataDirectory,"Rolleston_Stakes.csv")
+RollestonDEMFile <- file.path(GISDirectory,"rolelevnztm")
+
+#Find the filename of the Accumulation Ablation Shapefile. Note that this has to have an attribute called "Type" with the accumulation area polygon called "Accumulation", and the ablation polygon called "Ablation". It should be possible to create this using the glacier outline and the EOSS line. Something for the future.
+AccumulationAblationShapefileName <- list.files(file.path(GISDirectory,paste0(MassBalanceYear -1,"-",MassBalanceYear)),pattern = "^AccumulationAblation.*shp$",full.names  = TRUE)
+
+#Find the filename of the end-of-summer-snowline shapefile. Note that this is a lineshape file.
+EOSSShapefileName <- list.files(file.path(GISDirectory,paste0(MassBalanceYear -1,"-",MassBalanceYear)),pattern = "^EOSS.*shp$",full.names  = TRUE)
+```
+
+Now lets load the Glacier outline, End-Of-Summer snowline line shapefile, DEM, Accumulation/Ablation polygon shapefile, stake points, pit location and probe locations.
+```{r,fig.height=5,fig.width=7.5}
+#Load the glacier outline and explicitly set the projection to NZTM
+#RollestonGlacierOutline <- readOGR(dsn=file.path(GISDirectory),layer=RollestonGlacierOutlineFile)
+RollestonGlacierOutline <- terra::vect(file.path(GISDirectory,RollestonGlacierOutlineFile)) %>% terra::project(y="epsg:2193")
+
+#RollestonGlacierOutline <- spTransform(RollestonGlacierOutline, crs('+init=epsg:2193'))
+
+#Create a spatial point file of 30 m grid spacing across the glacier for use in kriging
+#GlacierGrid <- as_Spatial(st_make_grid(st_as_sfc(RollestonGlacierOutline), cellsize = 30, what = "centers"))
+#GlacierGrid <- as_Spatial(st_make_grid(st_as_sf(RollestonGlacierOutline), cellsize = 30, what = "centers"))
+GlacierGrid <- terra::vect(st_make_grid(st_as_sf(RollestonGlacierOutline), cellsize = 30, what = "centers")) %>% terra::project(y="epsg:2193")
+#Explicitly set the projection to NZTM
+#GlacierGrid <- spTransform(GlacierGrid, crs('+init=epsg:2193'))
+
+#Load the end of summer accumulation and ablation area shape file and explicitly set the projection to NZTM
+#AccumulationAblationAreas <- readOGR(dsn = dirname(AccumulationAblationShapefileName), layer = basename(AccumulationAblationShapefileName))
+AccumulationAblationAreas <- terra::vect(AccumulationAblationShapefileName) %>% terra::project(y="epsg:2193")
+#crs(AccumulationAblationAreas) <- crs(GlacierGrid)
+#AccumulationAblationAreas <- spTransform(AccumulationAblationAreas, crs('+init=epsg:2193'))
+
+#Load the end of summer snow line shape file and explicitly set the projection to NZTM
+#EOSSLine <- readOGR(dsn = dirname(EOSSShapefileName), layer = basename(EOSSShapefileName))
+EOSSLine <- terra::vect(EOSSShapefileName) %>% terra::project(y="epsg:2193")
+#EOSSLine <- spTransform(EOSSLine, crs('+init=epsg:2193'))
+
+#Get the DEM data
+#RollestonDEM <- crop(raster(RollestonDEMFile),bbox(RollestonGlacierOutline))
+RollestonDEM <- terra::rast(RollestonDEMFile) %>% terra::crop(RollestonGlacierOutline)
+
+#Get the data. Note that stake data is for all years, so is in a different directory
+PitData   <- lapply(DensityFileNameList, read.csv, stringsAsFactors = FALSE,colClasses = c("character","character","myDate",rep("numeric",6),"character"))
+ProbeData <- lapply(DepthFileNameList, read.csv, stringsAsFactors = FALSE,colClasses = c("character","character","character",rep("numeric",4),"character"))
+ProbedDates <- as.Date(sub("Rolleston_depths_","",file_path_sans_ext(basename(DepthFileNameList))),format="%Y%m%d")
+#assume that the earlier date is the winter observations, and the later is summer
+names(ProbeData)[order(ProbedDates)] <- c("EndOfWinter","EndOfSummer")
+StakeData <- read.csv(StakeFileName,stringsAsFactors = FALSE,colClasses = c("myDate","character",rep("numeric",5),"character"))
+#Limit the stake data to just the date(s) of interest, taken to be any dates before September of the mass balance year, but after the previous September
+StakeData <- StakeData[StakeData$Date > as.Date(paste(MassBalanceYear - 1,"09","01"),"%Y %m %d") & 
+                         StakeData$Date < as.Date(paste(MassBalanceYear,"09","01"),"%Y %m %d"),]
+
+#Convert the point data to spatial data
+# spPitPoints <- SpatialPointsDataFrame(PitData[,c("Easting.NZTM.","Northing.NZTM.")],proj4string=CRS('+init=epsg:2193'),data=PitData)
+#spProbePoints <- lapply(ProbeData, function(x) {SpatialPointsDataFrame(x[,c("Easting_NZTM","Northing_NZTM")],proj4string=CRS('+init=epsg:2193'),data=x)})
+spProbePoints <- lapply(ProbeData, function(x) {terra::vect(x, geom=c("Easting_NZTM","Northing_NZTM"), crs="epsg:2193")})
+
+#spStakePoints <- SpatialPointsDataFrame(StakeData[,c("E_NZTM","N_NZTM")],proj4string=CRS('+init=epsg:2193'),data=StakeData)
+spStakePoints <- terra::vect(StakeData, geom=c("E_NZTM","N_NZTM"), crs="epsg:2193")
+#Put them in a list for simplicity of later processing
+# ObservedData <- list(PitPoints = spPitPoints, ProbePoints = spProbePoints, StakePoints = spStakePoints, Outline = RollestonGlacierOutline)
+
+#Get the extents of the glacier in lat lon
+#GlacierExtentLatLon <- extent(projectExtent(RollestonGlacierOutline, crs('+init=epsg:4326')))
+GlacierExtentLatLon <- terra::project(RollestonGlacierOutline, y='epsg:4326') %>% terra::ext()
+#Expand the extents to provide extents for the topographical map to download
+MapExtents <- GlacierExtentLatLon + 0.005
+
+```
+This chunk takes the DEM and develops an area-elevation hypsometric curve.
+```{r}
+#Clip the DEM to the Rolleston Glacier area
+GlacierDEM <- terra::mask(RollestonDEM,RollestonGlacierOutline)
+DEMData <- terra::values(GlacierDEM)
+DEMData <- DEMData[!is.na(DEMData)]
+DEMData <- DEMData[order(DEMData)]
+
+#From the DEM bin all the elevations into equal sized bins
+DEMBins <- split(DEMData, ceiling(seq_along(DEMData)/20))
+
+#Calculate the area in each bin (same as the number of cells multiplied by the resolution) and the average elevation of each bin
+BinAreas <- sapply(DEMBins, function(x) {length(x) * prod(terra::res(GlacierDEM))})
+BinElevations <- sapply(DEMBins, mean)
+BinAreaBelow <- cumsum(BinAreas)
+
+#Build the look up table of elevation vs total area
+AreaElevationCurve <- data.frame(Area = BinAreaBelow, Elevation = BinElevations)
+
+#Plot it to have a look
+plot(AreaElevationCurve,typ="l")
+```
+Calculate the end of winter snow water equivalent by interpolating snow depth measurements (converted to SWE using density observations)  using kriging across the glacier domain. 
+```{r}
+#Get the end of winter snow depths
+EndOfWinterDepths <- spProbePoints[["EndOfWinter"]]
+
+#remove any duplicate coordinates otherwise the Kriging results in NA's see https://gis.stackexchange.com/questions/250862/r-kriging-cross-validation-returns-na-for-all-prediction-points
+#EndOfWinterDepths = EndOfWinterDepths[which(!duplicated(EndOfWinterDepths@coords)),]
+EndOfWinterDepths = terra::unique(EndOfWinterDepths)
+
+#Convert to snow water equivalent using the pit data
+#EndOfWinterDepths@data$SWE <- SnowDepthToSWE(EndOfWinterDepths@data$Snow_Depth_m*1000, min(ProbedDates),PitData = PitData) 
+EndOfWinterDepths$SWE <- SnowDepthToSWE(EndOfWinterDepths$Snow_Depth_m*1000, min(ProbedDates),PitData = PitData) 
+
+EndOfWinterDepths$DEMValues <- terra::extract(RollestonDEM, EndOfWinterDepths,ID=FALSE)
+
+#future efforts should include anisotropy, in that snow depths probably generally increase up the glacier, and this could be included in the kriging consideration.
+
+#convert EndoFWinterDepths to an sf object to use it in variogram()
+SampleVariogram <- variogram(SWE~1,sf::st_as_sf(EndOfWinterDepths),cutoff=400) #Note sometimes need to play with the cutoff value (distance around a point to consider) to get a semi variogram fit. This worked for 2021
+#SampleVariogram <- variogram(SWE~1,EndOfWinterDepths,cutoff=250) #Note sometimes need to play with the cutoff value (distance around a point to consider) to get a semi variogram fit. This worked for 2020
+#SampleVariogram <- variogram(SWE~1,EndOfWinterDepths,cutoff=150) #This worked for 2019
+#vs.fit <- fit.variogram(SampleVariogram, vgm(psill=250000, "Sph", range=150,nugget=50000),fit.method = 1) #Use this and the next line to explore different options. Worked for 2020
+vs.fit <- fit.variogram(SampleVariogram, vgm(psill=1000000, "Gau", range=500,nugget=50000),fit.method= 7) #Use this and the next line to explore different options. Worked for 2019 and 2021
+#plot(SampleVariogram,vs.fit)
+vari.model <- fit.variogram(SampleVariogram, model=vgm(psill = 1000000,"Gau",range=500,nugget = 50000),fit.method = 7) #note the use of fit.method argument as using the default fit.method meant the fitting failed to converge.
+
+#Add a "DEMValues" attribute to the Glacier Grid, so that it can be used in the kriging
+GlacierGrid$DEMValues <- terra::extract(RollestonDEM, GlacierGrid,ID=FALSE)
+
+#The actual kriging. Just using 12 points at a time. Spatial data needs to be an sf object
+KrigedSWE <- krige(SWE~1,locations=sf::st_as_sf(EndOfWinterDepths),newdata=sf::st_as_sf(GlacierGrid),model=vari.model,nmax=12)
+
+#Prepare a raster grid to convert the points to. 
+r <- terra::rast(terra::ext(RollestonGlacierOutline), resolution= 30, crs = terra::crs(KrigedSWE))
+EOWSWERaster <- terra::rasterize(KrigedSWE,r,field='var1.pred')
+
+#Resample to 5 m and align with the DEM grid
+EOWSWERaster5m <- terra::resample(EOWSWERaster, RollestonDEM)
+
+#Clip to the glacier outline
+EOWSWERaster5mGlacier <- terra::mask(EOWSWERaster5m,RollestonGlacierOutline)
+
+#Save a copy for external use
+terra::writeRaster(EOWSWERaster5mGlacier,file.path(GISDirectory,paste0("EOW-Gain",format(min(StakeData$Date),"%Y%m%d"),".tif")),overwrite=TRUE)
+
+#Winter accumulation
+WinterAccumulation <- round(mean(EOWSWERaster5mGlacier[!is.na(EOWSWERaster5mGlacier)]),0)
+
+#Winter average snow
+paste0("Area averaged winter accumulation of ",WinterAccumulation, " mm of snow water equivalent")
+```
+Plot the interpolated snow water equivalent
+```{r}
+{
+plot(EOWSWERaster5mGlacier,main="End of winter snow water equivalent (mm)")
+plot(RollestonGlacierOutline,add=T)
+}
+```
+
+Figure out the total snow and ice melt depth for each stake location.
+This requires working through each of the stakes from the survey start time, and finding the stake from the later survey that is nearest it and how much has emerged.
+Also need to look for any intermediate re-drilling of stakes, and account for that as well (e.g. in January and 2018)
+```{r}
+#Get all the survey dates
+SurveyDates <- unique(StakeData$Date)
+FirstStakeIndices <- which(StakeData$Date == min(SurveyDates))
+
+#Initialise TotalSurfaceLowering, and TotalSWEMelt vectors
+TotalSurfaceLowering <- rep(0,length(FirstStakeIndices))
+TotalSWEMelt <- rep(0,length(FirstStakeIndices))
+
+#loop through each stake
+for (StakeIndex in FirstStakeIndices){
+  StakeOfInterest <- StakeData[StakeIndex,]
+  InitialSnowDepth <- StakeOfInterest$Snow_Depth_m
+  StakeEmergence <- StakeOfInterest$length_of_stake_emerged_mm
+  #Check if other stake data exist within 20 m, assumed to be the same stake
+  #This uses the nn2 function which finds the indices of points within a certain radius
+  SameStakeIndices <- which(nn2(StakeData[StakeIndex,c(4,5)],StakeData[,c(4,5)],radius = 20, searchtype = "radius")$nn.idx ==1)
+  #Get dates of surveys of this stake
+  ThisStakesSurveyDates <- unique(StakeData$Date[SameStakeIndices])
+  
+  #Check that a final survey date exists. If it doesn't then the stake was lost.
+  
+  
+  #now loop through each of these dates, gathering information as you go
+  for (SurveyDate in ThisStakesSurveyDates[-1]) {
+    #Determine if the survey is a reset, or the last survey for the stake
+    NextSurveyIndices <- SameStakeIndices[which(StakeData$Date[SameStakeIndices] == SurveyDate)]
+    if(length(NextSurveyIndices) > InitialSnowDepth) {
+      TotalSurfaceLowering[StakeIndex] <- max(StakeData$length_of_stake_emerged_mm[NextSurveyIndices]) - StakeEmergence + TotalSurfaceLowering[StakeIndex]
+      StakeEmergence <- min(StakeData$length_of_stake_emerged_mm[NextSurveyIndices]) 
+    } else {
+      #browser()
+      TotalSurfaceLowering[StakeIndex] <- StakeData$length_of_stake_emerged_mm[NextSurveyIndices] - StakeEmergence + TotalSurfaceLowering[StakeIndex]
+      FinalSnowDepth <- StakeData$Snow_Depth_m[NextSurveyIndices]
+      }
+  }
+  #Stake melt may sometimes be just snow, or a mix of snow and ice.
+      #If the total surface lowering is greater than the initial snow depth, then the total snow melt equals the first-survey snow depth * first-survey snow density.
+      #The total ice melt is the total melt depth less the first-survey snow depth * ice density
+      #If there is still snow around the stake at the last survey, then the melt is all snow, but the amount is complicated as snow can compress over summer.
+      #The total snow melt is the (first-survey snow depth * first-survey snow density) minus (last-survey snow depth * last-survey snow density)
+  #browser()
+  if (TotalSurfaceLowering[StakeIndex] > InitialSnowDepth){
+    #browser()
+    SnowMeltSWE <- SnowDepthToSWE(InitialSnowDepth*1000, min(SurveyDates),PitData = PitData)
+    IceMeltSWE <- (TotalSurfaceLowering[StakeIndex] - InitialSnowDepth*1000)/1000 * IceDensity
+    TotalSWEMelt[StakeIndex] <- SnowMeltSWE + IceMeltSWE
+  } else {
+    TotalSWEMelt[StakeIndex] <- SnowDepthToSWE(InitialSnowDepth*1000, min(SurveyDates),PitData = PitData) - 
+      SnowDepthToSWE(FinalSnowDepth * 1000, max(SurveyDates),PitData=PitData)
+  }
+  
+}
+
+#The TotalSWEMelt needs to be added to the stake spatial data as an attribute
+#Get the locations of the stakes of the first survey
+InitialStakeLocations <- spStakePoints[spStakePoints$Date == min(SurveyDates),]
+InitialStakeLocations$TotalSWEMelt <- TotalSWEMelt
+InitialStakeLocations$TotalMeltDepth <- TotalSurfaceLowering
+```
+The melt over the whole ablation part of the glacier needs to be interpolated from the stake measurements. This is done by assuming the primary control on melt is elevation, and using the glacier elevation to distribute the melt observations. In addition to the stake measurements, the end-of-summer-snowline has been used to provide an additional elevation-to-snow melt point.
+
+The average elevation of the EOSS is required and the average winter SWE at that elevation.
+Use the elevation-area hypsometric curve and the accumulation area for the glacier to determine the EOSS elevation.
+
+A relationship between melt and elevation is determined (including the stakes and the EOSS elevation, EOSS winter SWE), applied to the DEM and spatially clipped to the ablation area.
+The total melt is then calculated.
+```{r}
+#Get the elevation of the stakes by sampling the DEM at the stake locations
+StakeDEMElevations <- terra::extract(RollestonDEM,spStakePoints,ID=FALSE)[FirstStakeIndices,]
+
+#Get the elevation of the EOSS. This is done by finding the area of the end-of-summer ablation area, and then reading off the elevation from the area-elevation hypsometric curve created earlier.
+#Note that this is an approximation to get around the problem of the EOSS not really being at a single elevation.
+#AblationArea <- gArea(AccumulationAblationAreas[AccumulationAblationAreas$Type=="Ablation",])
+AblationArea <- terra::expanse(AccumulationAblationAreas[AccumulationAblationAreas$Type=="Ablation",])
+EOSSElevation <- AreaElevationCurve[which.min(abs(AreaElevationCurve$Area-AblationArea)),'Elevation']
+
+#Get the end-of-winter snow depth (in swe) for the EOSS line
+EOSSMelt <- mean(terra::extract(EOWSWERaster,EOSSLine,ID=FALSE)[,1],na.rm=TRUE)
+
+#Create a linear model relating melt to elevation, including the EOSS melt and elevation
+MeltElevationModel <- lm(melt ~ elevation, list(melt = c(TotalSWEMelt,EOSSMelt),elevation = c(StakeDEMElevations,EOSSElevation)))
+
+#Use that model to apply to the elevation raster
+MeltRaster <- MeltElevationModel$coefficients[2]* GlacierDEM + MeltElevationModel$coefficients[1]
+
+#Restrict to the ablation area
+#Next line is for backwards compatability of column names in the AccumulationAblation spatial data
+if ("AreaType" %in% names(AccumulationAblationAreas)) AccumulationAblationAreas@data <- rename(AccumulationAblationAreas@data, Type = AreaType)
+AblationMelt <- terra::mask(MeltRaster,AccumulationAblationAreas[AccumulationAblationAreas$Type=="Ablation",])
+#Calculate average melt over the ablation area
+paste0("Area averaged summer melt over the ablation area of ",round(mean(AblationMelt[!is.na(AblationMelt)]),0), " mm of snow water equivalent")
+```
+
+Plot the ablation area summer melt
+```{r}
+{
+plot(AblationMelt, main = "Ablation Area Summer Melt")
+plot(AccumulationAblationAreas,add=T)
+}
+```
+The summer snow interpolation should include zero values on the edge of the accumulation area that is not on the edge of the glacier.
+Interpolate the end-of-summer snow depth observations in a similar manner to the end-of-winter ones, except include the EOSS values as 0. This requires use of the end-of-summer-snowline.
+Once completed, subtract the end-of-summer values from the end-of-winter values to find the total melt over summer. Clip this to the accumulation area. Combine this with the ablation area data to get the total summer melt.
+```{r}
+#Load the end of summer snowline
+
+#Sample along the End-Of-Summer-Snowline at 20 m intervals.
+EOSSSampleSize <- floor(terra::perim(EOSSLine)/20)
+#EOSSSamples <- spsample(EOSSLine, type = "regular", n=EOSSSampleSize)
+#EOSSSample <- SpatialPointsDataFrame(EOSSSamples, data.frame(SWE=rep(0,length(EOSSSamples))))
+
+#The following is not implemented yet (as of 2024)
+#EOSSSample <- terra::spatSample(EOSSLine,size = EOSSSampleSize, method = "regular")
+EOSSSample <- st_line_sample(sf::st_as_sf(EOSSLine), n = EOSSSampleSize, type = "regular") %>% terra::vect() %>% terra::disagg()
+EOSSSample$SWE <- 0
+
+#Get the end of summer snow depths
+EndOfSummerDepths <- spProbePoints[["EndOfSummer"]]
+
+#Some years there is no end-of-summer probes because there is not much snow (e.g. 2018), so only interpolate if they exist
+if (!is.null(EndOfSummerDepths)){
+#Convert to snow water equivalent using the pit data
+EndOfSummerDepths$SWE <- SnowDepthToSWE(EndOfSummerDepths$Snow_Depth_m*1000, max(ProbedDates),PitData = PitData)
+
+#Combine the EOSS points (set to 0), with the snow depth observations
+EndOfSummerDepthsAndEOSS <- terra::union(EOSSSample,EndOfSummerDepths)
+#EndOfSummerDepthsAndEOSS <- EndOfSummerDepths
+
+#Need to get rid of any duplicate locations
+EndOfSummerDepthsAndEOSS <- terra::unique(EndOfSummerDepthsAndEOSS)
+
+SampleVariogram <- variogram(SWE~1,sf::st_as_sf(EndOfSummerDepthsAndEOSS))
+
+vari.model <- autofitVariogram(SWE~1,sf::st_as_sf(EndOfSummerDepthsAndEOSS),model="Sph")$var_model
+
+#The actual kriging. Just using 12 points at a time.
+KrigedEOSSWE <- krige(SWE~1,locations=sf::st_as_sf(EndOfSummerDepthsAndEOSS),newdata=sf::st_as_sf(GlacierGrid),model=vari.model,nmax=12)
+
+
+#Prepare a raster grid to convert the points to. 
+#Note the need to adjust the extent to be 15 m greater than the kriged points, as the kriged points were prepared using the GlacierGrid centres
+#r <- terra::rast(xmin = 1479467, xmax = 1479947, ymin = 5250212, ymax= 5250722, resolution = 30,crs = terra::crs(KrigedEOSSWE))
+r <- terra::rast(terra::ext(RollestonGlacierOutline), resolution= 30, crs = terra::crs(KrigedSWE))
+EOSSWERaster <- terra::rasterize(KrigedEOSSWE,r,field='var1.pred')
+
+#Resample to 5 m and align with the DEM grid
+EOSSWERaster5m <- terra::resample(EOSSWERaster, RollestonDEM)
+
+#Clip to the accumulation area.
+EOSSWERaster5mGlacier <- terra::mask(EOSSWERaster5m,AccumulationAblationAreas[AccumulationAblationAreas$Type=="Accumulation",])
+} else EOSSWERaster5mGlacier <- terr::mask(GlacierDEM - GlacierDEM,AccumulationAblationAreas[AccumulationAblationAreas$Type=="Accumulation",])
+
+#Subtract the summer remaining snow from the end-of-winter snow
+AccumulationAreaMelt <- EOWSWERaster5mGlacier- EOSSWERaster5mGlacier
+
+#Calculate average melt over the accumulation area
+paste0("Area averaged summer melt over the accumulation area of ",round(mean(AccumulationAreaMelt[!is.na(AccumulationAreaMelt)]),0), " mm of snow water equivalent")
+```
+
+Now plot the accumulation area melt
+
+```{r}
+{
+plot(AccumulationAreaMelt, main = "Accumulation Area Summer Melt")
+plot(AccumulationAblationAreas,add=T)
+}
+```
+
+
+```{r}
+#Merge the accumulation area melt with the ablation area melt
+TotalGlacierMelt <- raster::merge(AccumulationAreaMelt,AblationMelt)
+
+#Save a copy for external use
+terra::writeRaster(TotalGlacierMelt,file.path(GISDirectory,                                     paste0("EOS-Melt",format(max(StakeData$Date),"%Y%m%d"),".tif")),overwrite=TRUE)
+
+SummerMelt <- round(mean(TotalGlacierMelt[!is.na(TotalGlacierMelt)]),0)
+#Calculate average melt over the accumulation area
+paste0("Area averaged summer melt of ",SummerMelt, " mm of snow water equivalent")
+```
+
+Now plot the whole glacier's summer melt
+
+```{r}
+{
+plot(TotalGlacierMelt, main = "Summer Melt (mm)")
+plot(RollestonGlacierOutline,add=T)
+}
+```
+And last of all is to plot the annual balance
+```{r}
+AnnualBalance <- EOWSWERaster5mGlacier - TotalGlacierMelt
+
+#Save a copy for external use
+terra::writeRaster(AnnualBalance,file.path(GISDirectory,
+paste0("Annual Mass Balance-",MassBalanceYear-1,"-",MassBalanceYear,".tif")),overwrite=TRUE)
+
+MeanAnnualBalance <- round(mean(AnnualBalance[!is.na(AnnualBalance)]),0)
+
+
+
+#Calculate average balance change over the glacier
+paste0("Area averaged mass balance change of ",MeanAnnualBalance, " mm of snow water equivalent")
+
+```
+```{r}
+AnnualBalance_stars <- stars::st_as_stars(AnnualBalance)
+mapview(AnnualBalance_stars, na.color = rgb(0, 0, 0, 0, names = NULL, maxColorValue = 1),map.types = c("Esri.WorldShadedRelief", "OpenStreetMap.DE"))
+
+{
+plot(AnnualBalance, main = "Annual Balance (mm)")
+plot(RollestonGlacierOutline,add=T)
+}
+```
+
+
+So I now have stake melt, snow depths, winter balance, summer balance and annual balance.
+I should spit out the numbers in a table ready for WGMS.
+I need to know the maximum and minimum number of measurements in the accmulaton area and the ablation area (see WGMS submission guidleines)
+
+```{r}
+#Create a dataframe of the useful stuff
+BalanceTotals <- data.frame(WinterBalance = WinterAccumulation,
+           SummerBalance = SummerMelt,
+             AnnualBalance = MeanAnnualBalance)
+
+BalanceTotals
+paste("Equilibrium line altitude = ",round(EOSSElevation),"m asl")
+
+#Find the number of measurements in the summer and winter in the accumulation and ablation areas. Assume the stakes last the whole year.
+spWinterPit <- terra::vect( unique(PitData[[1]][,c("Easting.NZTM.","Northing.NZTM.")]),geom=c("Easting.NZTM.","Northing.NZTM."),crs='epsg:2193')
+#In the case where no summer pit was dug (e.g. 2018) just set the location completely off grid!
+if(length(PitData) > 1){
+spSummerPit <- terra::vect( unique(PitData[[2]][,c("Easting.NZTM.","Northing.NZTM.")]),geom=c("Easting.NZTM.","Northing.NZTM."),crs='epsg:2193')
+} else spSummerPit <- terra::vect(data.frame('Easting.NZTM.' = 0,'Northing.NZTM.'=0),geom=c("Easting.NZTM.","Northing.NZTM."),crs='epsg:2193')
+
+#Winter accumulation area observation count
+PitsAccumulation <- AccumulationAblationAreas %>% terra::subset(.$Type == "Accumulation") %>% terra::relate(spWinterPit,relation= "contains", pairs=TRUE) %>% nrow()
+StakesAccumulation <- AccumulationAblationAreas %>% terra::subset(.$Type == "Accumulation") %>% terra::relate(spStakePoints[spStakePoints$Date == SurveyDates[1],],relation= "contains", pairs=TRUE) %>% nrow()
+ProbesAccumulation1 <- AccumulationAblationAreas %>% terra::subset(.$Type == "Accumulation") %>% terra::relate(spProbePoints[[1]],relation= "contains", pairs=TRUE) %>% nrow()
+TotalWinterObsInAccumulationArea <- PitsAccumulation + StakesAccumulation + ProbesAccumulation1
+
+#Summer accumulation area observation count
+PitsAccumulation <- AccumulationAblationAreas %>% terra::subset(.$Type == "Accumulation") %>% terra::relate(spSummerPit,relation= "contains", pairs=TRUE) %>% nrow()
+StakesAccumulation <- AccumulationAblationAreas %>% terra::subset(.$Type == "Accumulation") %>% terra::relate(spStakePoints[spStakePoints$Date == tail(SurveyDates,1),],relation= "contains", pairs=TRUE) %>% nrow()
+
+#In the case where no summer probes were made (e.g. 2018) just set the probe locations to 0
+if(length(spProbePoints)>1){
+ProbesAccumulation2 <- AccumulationAblationAreas %>% terra::subset(.$Type == "Accumulation") %>% terra::relate(spProbePoints[[2]],relation= "contains", pairs=TRUE) %>% nrow()
+
+} else ProbesAccumulation2 <- 0
+TotalSummerObsInAccumulationArea <- PitsAccumulation + StakesAccumulation + ProbesAccumulation2
+
+MIN_NUMBER_OF_MEASUREMENT_SITES_IN_ACCUMULATION_AREA <- min(TotalWinterObsInAccumulationArea ,TotalSummerObsInAccumulationArea)
+MAX_NUMBER_OF_MEASUREMENT_SITES_IN_ACCUMULATION_AREA <- max(TotalWinterObsInAccumulationArea ,TotalSummerObsInAccumulationArea)
+
+#Winter ablation area observation count
+PitsAblation <- AccumulationAblationAreas %>% terra::subset(.$Type == "Ablation") %>% terra::relate(spWinterPit,relation= "contains", pairs=TRUE) %>% nrow()
+StakesAblation <- AccumulationAblationAreas %>% terra::subset(.$Type == "Ablation") %>% terra::relate(spStakePoints[spStakePoints$Date == SurveyDates[1],],relation= "contains", pairs=TRUE) %>% nrow()
+ProbesAblation1 <- AccumulationAblationAreas %>% terra::subset(.$Type == "Ablation") %>% terra::relate(spProbePoints[[1]],relation= "contains", pairs=TRUE) %>% nrow()
+
+TotalWinterObsInAblationArea <- PitsAblation + StakesAblation + ProbesAblation1
+
+#Summer ablation area observation count
+PitsAblation <- AccumulationAblationAreas %>% terra::subset(.$Type == "Ablation") %>% terra::relate(spSummerPit,relation= "contains", pairs=TRUE) %>% nrow()
+StakesAblation <- AccumulationAblationAreas %>% terra::subset(.$Type == "Ablation") %>% terra::relate(spStakePoints[spStakePoints$Date == tail(SurveyDates,1),],relation= "contains", pairs=TRUE) %>% nrow()
+#In the case where no summer probes were made (e.g. 2018) just set the probe locations to 0
+if(length(spProbePoints) >1) ProbesAblation2 <- AccumulationAblationAreas %>% terra::subset(.$Type == "Ablation") %>% terra::relate(spProbePoints[[2]],relation= "contains", pairs=TRUE) %>% nrow() else ProbesAblation2 <- 0
+
+TotalSummerObsInAblationArea <- PitsAblation + StakesAblation + ProbesAblation2
+
+MIN_NUMBER_OF_MEASUREMENT_SITES_IN_ABLATION_AREA <- min(TotalWinterObsInAblationArea ,TotalSummerObsInAblationArea)
+MAX_NUMBER_OF_MEASUREMENT_SITES_IN_ABLATION_AREA <- max(TotalWinterObsInAblationArea ,TotalSummerObsInAblationArea)
+
+AccumulationArea <- terra::expanse(AccumulationAblationAreas[AccumulationAblationAreas$Type=="Accumulation",])
+
+paste("MinObsInAcc:",MIN_NUMBER_OF_MEASUREMENT_SITES_IN_ACCUMULATION_AREA)
+paste("MaxObsInAcc:",MAX_NUMBER_OF_MEASUREMENT_SITES_IN_ACCUMULATION_AREA)
+paste("MinObsInAbl:",MIN_NUMBER_OF_MEASUREMENT_SITES_IN_ABLATION_AREA)
+paste("MaxObsInAbl:",MAX_NUMBER_OF_MEASUREMENT_SITES_IN_ABLATION_AREA)
+paste("Accumulation area size:",round(AccumulationArea/1000000,3),"km2" )
+paste("Ablation area size:",round(AblationArea/1000000,3),"km2" )
+paste("Accumulation area ratio:", round(AccumulationArea / (AblationArea + AccumulationArea) * 100), "%")
+```
+For the WGMS Submission form I need a table of information describing the point measurements. This is all the probe and stake observations.
+For each one I need to know the date range for which the measurements apply, any identification of the observation, location, in lat lon, and elevation (m asl), the point balance in m we, the density used (in kg / m3) for depth to water equivalent conversions, the "balance code", either BW for winter balance, or BS for summer balance or BA for Annual balance. Winter pobing is BW, stakes are BS, summer probes are BA. Summer probe start times are from the previous summer probe date. 
+```{r}
+#Start with winter balances. These are the probed depths.
+EndOfWinterDepths[,c("Longitude","Latitude")] <- terra::project(EndOfWinterDepths,'epsg:4326') %>% terra::crds(df=TRUE)
+EndOfWinterDepths$Density <-  round(EndOfWinterDepths$SWE / EndOfWinterDepths$Snow_Depth_m)
+EndOfWinterDepths$WGMSBalanceCode <- "BW"
+View(as.data.frame(EndOfWinterDepths)[,c("Latitude","Longitude","DEMValues","SWE","Density")])
+
+#Summer balances are the stake observations
+InitialStakeLocations[,c("Longitude","Latitude")] <- terra::project(InitialStakeLocations,'epsg:4326') %>% terra::crds(df=TRUE) 
+InitialStakeLocations$DEMValues <- terra::extract(RollestonDEM, InitialStakeLocations,ID=FALSE)
+InitialStakeLocations$Density <-round(InitialStakeLocations$TotalSWEMelt /
+                                           InitialStakeLocations$TotalMeltDepth * 1000)
+InitialStakeLocations$WGMSBalanceCode <- "BS"
+InitialStakeLocations$SWE <- InitialStakeLocations$TotalSWEMelt
+InitialStakeLocations$Point_ID <- paste0("Stake",order(InitialStakeLocations$Elevation..mae.,decreasing = TRUE))
+View(as.data.frame(InitialStakeLocations)[,c("Point_ID","Latitude","Longitude","DEMValues","TotalSWEMelt","Density")])
+
+#And any summer probes
+EndOfSummerDepths[,c("Longitude","Latitude")] <- terra::project(EndOfSummerDepths,'epsg:4326') %>% terra::crds(df=TRUE)  
+EndOfSummerDepths$Density <-  round(EndOfSummerDepths$SWE / EndOfSummerDepths$Snow_Depth_m)
+EndOfSummerDepths$DEMValues <- terra::extract(RollestonDEM, EndOfSummerDepths,ID=FALSE)
+EndOfSummerDepths$WGMSBalanceCode <- "BA"
+View(as.data.frame(EndOfSummerDepths)[,c("Latitude","Longitude","DEMValues","SWE","Density")])
+
+#Combine the three tables and save as a csv file for easy copying into the WGMS form
+#### need to still add ID, from and to dates and uncertainties.*****
+PointBalanceData <- rbind(EndOfWinterDepths[c("Point_ID","Latitude","Longitude","DEMValues","SWE","Density","WGMSBalanceCode")],
+                          InitialStakeLocations[c("Point_ID","Latitude","Longitude","DEMValues","SWE","Density","WGMSBalanceCode")],
+                          EndOfSummerDepths[c("Point_ID","Latitude","Longitude","DEMValues","SWE","Density","WGMSBalanceCode")])
+
+#remove any 0 SummerDepth values, as these have an unknown balance.
+PointBalanceData <- PointBalanceData[!((PointBalanceData$SWE == 0) & (PointBalanceData$WGMSBalanceCode == "BA")),]
+
+write.csv(PointBalanceData,file.path(CurrentYearDataDirectory,"MassBalancePointDataForWGMSSubmission.csv") )
+```
+
+
+
+For bonus points the WGMS like elevation-banded mass balances areas.
+This may be generated from a combination of the DEM and the Annual mass balance maps
+I have arbitrarily selected 20 m elevation bands
+```{r}
+#From the DEM bin all the elevations into equal sized bins
+BinLowElevations <- seq(from = 1720,to= 1900, by = 20)
+BinHighElevations <- BinLowElevations + 20
+#DEMBins <- split(DEMData, findInterval(DEMData,BinLowElevations))
+
+#Calculate the area in each bin (same as the number of cells multiplied by the resolution) and the average elevation of each bin
+#BinAreas <- sapply(DEMBins, function(x) {length(x) * prod(res(GlacierDEM))})
+
+#BinAreaPct <- round(BinAreas * 100 / sum(BinAreas))
+
+#Build the look up table of elevation vs total area
+#ElevationHypsography <- data.frame(ElevationLow = BinLowElevations, ElevationHigh = BinHighElevations, AreaPct = BinAreaPct)
+
+#For the mass balance I need to get the average mass balance for each elevation band.
+#Start by creating a raster with each elevation band.
+#Reclasify the glacier DEM into elevation bands
+ReclassMatrix <- cbind(BinLowElevations,BinHighElevations,seq(1,length(BinLowElevations)))
+ElevationBands <- terra::classify(GlacierDEM, ReclassMatrix)
+
+CellsInEachBand <- terra::zonal(GlacierDEM/GlacierDEM, ElevationBands, fun='sum')
+BandAreaPct     <- round(CellsInEachBand[,2] / sum(CellsInEachBand[,2]) * 100)
+MassBalancePerBand <- terra::zonal(AnnualBalance, ElevationBands, fun='mean') %>% round()
+
+ElevationBandData <- data.frame(ElevationLow = BinLowElevations, ElevationHigh = BinHighElevations, AreaPct = BandAreaPct,MassBalance_mm=MassBalancePerBand[,2])
+write.table(ElevationBandData,file.path(DataDirectory,"IndividualYears",paste0(MassBalanceYear-1,"-",MassBalanceYear),paste0("ElevationBandData",MassBalanceYear,".csv")),quote = FALSE,sep=",",row.names = FALSE)
+
+```
+
+I also need the DEM elevations of the stake positions
+```{r}
+terra::extract(GlacierDEM,spStakePoints[spStakePoints$Date == tail(SurveyDates,1),],ID=FALSE)
+```
+

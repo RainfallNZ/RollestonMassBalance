@@ -1,0 +1,216 @@
+---
+title: "Rolleston Glacier Fieldwork map"
+output: html_notebook
+---
+
+This notebook has been prepared to enable preparation of a map of where observations have been taken on the Rolleston Glacier.
+Loadlibraries
+```{r}
+#if (!require(maptools)) install.packages('maptools'); library(maptools)
+if (!require(sp)) install.packages('sp'); library(sp)
+if (!require(rgdal)) install.packages('rgdal'); library(rgdal)
+if (!require(raster)) install.packages('raster'); library(raster)
+if (!require(terra)) install.packages('terra'); library(terra)
+if (!require(GISTools)) install.packages('GISTools'); library(GISTools)
+if (!require(plotKML)) install.packages('plotKML'); library(plotKML) #needed to read in the GPX data
+if (!require(slippymath)) install.packages('slippymath'); library(slippymath) #needed to figure ouot wmts tiles
+if (!require(sf)) install.packages('sf'); library(sf) #needed to work with slippymath
+if (!require(tools)) install.packages('tools'); library(tools) #has the very useful file_ext() function
+#if (!require(mdsumner/wmts))install.packages("remotes");remotes::install_github("mdsumner/wmts"); library(wmts)
+```
+
+
+Start by describing the various data sources:
+Set the observation date of interest
+Observation data
+Map data
+Spatial data
+```{r}
+#****************************************
+#Edit the date to match the survey date
+#***************************************
+DateOfInterest <- as.Date("2024-03-20")
+
+LINZAPIToken <- "85df745fa5d446fea241dd5ae40add85"
+LINZTopo50WMSURL <- "https://data.linz.govt.nz/services;key=YOUR_API_TOKEN/wms?service=WMS&version=1.1.1&request=GetMap&layers=layer-50767&format=image/png&width=364&height=400&bbox=LonMin,LatMin,LonMax,LatMax"
+ProjectDirectory <- "/media/drizzle/70DAC0494B655316/Projects/Rolleston Glacier/RollMassBal"
+
+#Check directory exists, if it doesn't try the windows path.
+if (!dir.exists(ProjectDirectory)){ProjectDirectory <- "D:\\Projects\\Rolleston Glacier\\RollMassBal"}
+DataDirectory <- file.path(ProjectDirectory,"data")
+GISDirectory <- file.path(ProjectDirectory,"GIS")
+
+#Figure out the directory that the pit and probe data are in as the directory naming convention is based on the mass balance year range.
+YearOfInterest <- as.numeric(format(DateOfInterest,"%Y"))
+MonthOfInterest <- as.numeric(format(DateOfInterest,"%m"))
+if (MonthOfInterest > 10){
+  PitAndProbeDataDirectory <- paste0("IndividualYears/",YearOfInterest,"-",YearOfInterest + 1)
+} else {
+  PitAndProbeDataDirectory <- paste0("IndividualYears/",YearOfInterest - 1,"-",YearOfInterest)
+}
+
+
+RollestonGlacierOutlineFile <- "Rolleston_outline_20220408_Sentinel2_NDSI.shp"
+ProbingFileName     <- file.path(DataDirectory,
+                                 PitAndProbeDataDirectory,
+                                 paste0("Rolleston_depths_",format(DateOfInterest,"%Y%m%d"),".csv"))
+SnowPitFileName     <-  file.path(DataDirectory,
+                                  PitAndProbeDataDirectory,
+                                  paste0("Rolleston_density_",format(DateOfInterest,"%Y%m%d"),".csv"))
+StakeFileName       <- file.path(DataDirectory,"Rolleston_Stakes.csv")
+
+#If an EOSS snowline spatial file exists, then use it. Can be either an ESRI shapefile or a GPX file which the MapToaster iphone app can produce.
+#EOSSFileName        <- "track-2021-03-23_09-01-55.gpx"
+#EOSSFileName        <- "EOSS_20240320.shp"
+```
+
+Now lets load the Glacier outline, stake points, pit location, probe locations and plot them on the Topo50 map.
+Note that the Topo50 data arrives in lat lon format, and I haven't figured out how to change that. This means I have to reproject everything to put it on the plot.
+```{r,fig.height=5,fig.width=7.5}
+#Load the glacier outline and explicitly set the projection to NZTM
+RollestonGlacierOutline <- terra::vect(file.path(GISDirectory,RollestonGlacierOutlineFile)) %>% terra::project(y="epsg:2193")
+
+#Get the data and convert to spatial objects. Note that stake data is for all years, so is in a different directory
+if (file.exists(SnowPitFileName)) {
+  PitData <- read.csv(SnowPitFileName)
+  spPitPoints <- terra::vect(PitData, geom=c("Easting.NZTM.","Northing.NZTM."), crs="epsg:2193")
+  } else spPitPoints <- NULL
+if (file.exists(ProbingFileName)) {
+  ProbeData <- read.csv(ProbingFileName)
+  spProbePoints <- terra::vect(ProbeData, geom=c("Easting_NZTM","Northing_NZTM"), crs="epsg:2193")
+
+  } else spProbePoints <- NULL
+StakeData <- read.csv(StakeFileName,stringsAsFactors = FALSE,
+                      colClasses = c("character","character",rep("numeric",5),"character"))
+#Limit the stake data to just the date(s) of interest
+StakeData <- StakeData[as.Date(StakeData$Date,"%d/%m/%Y") == DateOfInterest,]
+spStakePoints <- terra::vect(StakeData, geom=c("E_NZTM","N_NZTM"), crs="epsg:2193")
+
+if(exists("EOSSFileName")){
+  #if it is a GPX file then process it one way
+  if (tolower(file_ext(EOSSFileName)) == "gpx"){
+    #Get the snow line track data. This is in GPX format. Projected in WGS84
+    EOSSTrackPoints <- readGPX(file.path(GISDirectory,basename(PitAndProbeDataDirectory),EOSSFileName))[["tracks"]][[1]][[1]]
+    #Convert to a spatial file
+    EOSSLine <- terra:vect(as.matrix(EOSSTrackPoints[,c("lon","lat")]), type="lines",crs="epsg:4326")
+  } else if (tolower(file_ext(EOSSFileName)) == "shp"){ #if its an ESRI shapefile, process accordingly
+    EOSSLine <- terra::vect(file.path(GISDirectory,basename(PitAndProbeDataDirectory),EOSSFileName)) 
+    }
+
+} else {EOSSLine <- NULL}
+
+
+#Put them in a list for simplicity of later processing
+ObservedData <- list(PitPoints = spPitPoints, ProbePoints = spProbePoints, StakePoints = spStakePoints, Outline = RollestonGlacierOutline, EOSS = EOSSLine)
+
+#Get the extents of the glacier in lat lon
+GlacierExtentLatLon <- terra::project(RollestonGlacierOutline, crs('+init=epsg:4326')) %>% terra::ext()
+#Expand the extents to provide extents for the topographical map to download
+MapExtents <- GlacierExtentLatLon + 0.005
+
+#And use those extents to get the Topo50 data. Note that I seem to need to download the data first, then load it into R.
+#LINZ now provides TOPO50 data via a WMTS (not WMS) so the tiles that are wanted needed to be figured out before they are requested. 
+#It seems there is a standard projection (world mercator, EPSG:3857) used for WMTS
+
+WMTS_URL <- "http://tiles-a.data-cdn.linz.govt.nz/services;key=8ed417cc81ea45a0b92d597307229b80/tiles/v4/layer=52343/EPSG:3857/{z}/{x}/{y}.png"
+
+#What follows is derived from the slippymaths package
+#Create a vector of the bounding box
+sf_bbox <- sf::st_bbox(MapExtents)
+
+#Figure out the tile numbers and zoom level
+tile_grids <- bbox_to_tile_grid(sf_bbox, max_tiles = 4)
+
+#Figure out the coordinates of the extents of each of the tiles
+tile_bboxes <- tile_grid_bboxes(tile_grids)
+
+#Download each tile image
+Tile_images <- lapply(seq(1,nrow(tile_grids$tiles)), function(tile){
+  
+  Tile_URL <- sub("\\{z\\}",tile_grids$zoom,WMTS_URL)
+  Tile_URL <- sub("\\{x\\}",tile_grids$tiles[tile,'x'],Tile_URL)
+  Tile_URL <- sub("\\{y\\}",tile_grids$tiles[tile,'y'],Tile_URL)
+  Image <- terra::rast(paste0('/vsicurl/',Tile_URL))
+  
+  #Set the real extent of the tile
+  #raster::extent(Image) <- raster::extent(tile_bboxes[[tile]][c("xmin", "xmax", "ymin", "ymax")])
+   terra::ext(Image) <- terra::ext(tile_bboxes[[tile]][c("xmin", "xmax", "ymin", "ymax")])
+  
+  #Set the real projection
+  terra::crs(Image) <- 'epsg:3857'
+  
+  #Convert to an RGB brick so that colors are retained when merging them later
+  Image <- terra::colorize(Image, "rgb")
+  return(Image)
+})
+
+Topo50Map <- do.call(terra::merge,Tile_images)
+
+#Reproject the other spatial data to the maps projection ready for plotting
+reprojected.data <- lapply(ObservedData, function(SpatialElement) {
+  if(!is.null(SpatialElement)){terra::project(SpatialElement,terra::crs(Topo50Map))
+    }else {NULL}
+  })
+list2env(reprojected.data,env=.GlobalEnv)
+
+Topo50Map <- terra::crop(Topo50Map, y = terra::ext(Outline) + 300)
+#Reproject to the Topo50 coordinate system
+
+{
+plotRGB(Topo50Map,colNA="white")
+plot(Outline, add=TRUE)
+points(ProbePoints,pch=20)
+points(StakePoints, pch = 8, col = "dark green")
+points(PitPoints, pch = 0, cex=1.3, col = "brown")
+lines(EOSS, col = "black",lty=2)
+if(!is.null(EOSSLine)){
+legend("topleft",bty="n",legend=c("Pit","Stakes","Probes","EOSS","Glacier \nOutline"),pch=c(0,8,20,NA,NA),pt.cex=c(1.3,1,1,NA,NA),merge=TRUE,lty=c(-1,-1,-1,2,1))
+} else {
+legend("topleft",bty="n",legend=c("Pit","Stakes","Probes","Glacier \nOutline"),pch=c(0,8,20,NA),pt.cex=c(1.3,1,1,NA),merge=TRUE,lty=c(-1,-1,-1,1),col=c("brown","dark green","black","black"))
+}
+#browser()
+north.arrow(xb=par("usr")[1] + 100,yb=par("usr")[3]+300, len = 20)
+map.scale(xc=par("usr")[1] + 100,yc=par("usr")[3]+200,len=150, units= "metres", ndivs=1, subdiv = 150)
+}
+
+#Generate a plot file
+dev.copy(png,file=file.path(DataDirectory,PitAndProbeDataDirectory,
+                            paste0("ObservationMap_",format(DateOfInterest,"%Y%m%d"),".png"))
+         ,width=15,height=10,units="cm",res=600,family="Arial",pointsize=6)
+invisible(dev.off())
+```
+
+
+```{r}
+#if (!require(shiny)) install.packages("shiny"); library(shiny)
+if (!require(leaflet)) install.packages("leaflet"); library(leaflet)
+if (!require(htmltools)) install.packages("htmltools"); library(htmltools)
+if (!require(raster)) install.packages("raster"); library(raster)
+if (!require(rgdal)) install.packages("rgdal"); library(rgdal)
+#if (!require(grDevices)) install.packages("grDevices"); library(grDevices)
+
+NZTopo250 = 'http://tiles-a.data-cdn.linz.govt.nz/services;key=8ed417cc81ea45a0b92d597307229b80/tiles/v4/layer=52324/EPSG:3857/{z}/{x}/{y}.png'
+NZTopo50 = 'http://tiles-a.data-cdn.linz.govt.nz/services;key=8ed417cc81ea45a0b92d597307229b80/tiles/v4/layer=52343/EPSG:3857/{z}/{x}/{y}.png'
+
+#Setup the map
+map <- leaflet::leaflet(options = leafletOptions(minZoom = 14)) %>% 
+  setView(lng=171.525,lat=-42.89,zoom=9) %>%
+  #setMaxBounds(lng1 = 171.5213, lat1 = -42.88425, lng2=171.532, lat2=-42.89375) %>% 
+  addTiles(urlTemplate = NZTopo250, options = providerTileOptions(minZoom=2),attribution = "<a href=\"http://https://www.linz.govt.nz/\">LINZ</a>")
+
+#Add the Glacier outline
+map <- map %>% addPolygons()
+
+#Add the probe locations
+map <- map %>% addMarkers()
+
+#Add the pit location
+map <- map %>% addMarkers()
+
+#Add the stake locations
+map <- map %>% addMarkers()
+
+
+  
+```
+
