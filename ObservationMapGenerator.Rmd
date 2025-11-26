@@ -23,7 +23,7 @@ Spatial data
 #****************************************
 #Edit the date to match the survey date
 #***************************************
-DateOfInterest <- as.Date("2024-11-18")
+DateOfInterest <- as.Date("2025-11-23")
 
 LINZAPIToken <- "85df745fa5d446fea241dd5ae40add85"
 LINZTopo50WMSURL <- "https://data.linz.govt.nz/services;key=YOUR_API_TOKEN/wms?service=WMS&version=1.1.1&request=GetMap&layers=layer-50767&format=image/png&width=364&height=400&bbox=LonMin,LatMin,LonMax,LatMax"
@@ -44,7 +44,7 @@ if (MonthOfInterest > 10){
 }
 
 
-RollestonGlacierOutlineFile <- "Rolleston_outline_20220408_Sentinel2_NDSI.shp"
+RollestonGlacierOutlineFile <- "Rolleston_outline_20250313_Sentinel2_NDSI.shp"
 ProbingFileName     <- file.path(DataDirectory,
                                  PitAndProbeDataDirectory,
                                  paste0("Rolleston_depths_",format(DateOfInterest,"%Y%m%d"),".csv"))
@@ -55,7 +55,7 @@ StakeFileName       <- file.path(DataDirectory,"Rolleston_Stakes.csv")
 
 #If an EOSS snowline spatial file exists, then use it. Can be either an ESRI shapefile or a GPX file which the MapToaster iphone app can produce.
 #EOSSFileName        <- "track-2021-03-23_09-01-55.gpx"
-#EOSSFileName        <- "EOSS_20240320.shp"
+#EOSSFileName        <- "EOSS_20250313.shp"
 ```
 
 Now lets load the Glacier outline, stake points, pit location, probe locations and plot them on the Topo50 map.
@@ -148,8 +148,7 @@ reprojected.data <- lapply(ObservedData, function(SpatialElement) {
 list2env(reprojected.data,env=.GlobalEnv)
 
 Topo50Map <- terra::crop(Topo50Map, y = terra::ext(Outline) + 300)
-#Reproject to the Topo50 coordinate system
-#par(xpd=TRUE)
+
 {
 plotRGB(Topo50Map,colNA="white")
 plot(Outline, add=TRUE)
@@ -158,7 +157,8 @@ points(StakePoints, pch = 8, col = "dark green")
 points(PitPoints, pch = 0, cex=1.3, col = "brown")
 lines(EOSS, col = "black",lty=2)
 if(!is.null(EOSSLine)){
-legend("top",bty="n",legend=c("Pit","Stakes","Probes","EOSS","Glacier \nOutline"),pch=c(0,8,20,NA,NA),pt.cex=c(1.3,1,1,NA,NA),merge=TRUE,lty=c(-1,-1,-1,2,1),xpd=TRUE)
+legend("topleft",inset=c(0,0),bty="n",legend=c("Pit","Stakes","Probes","EOSS","Glacier \nOutline"),pch=c(0,8,20,NA,NA),pt.cex=c(1.3,1,1,NA,NA),merge=TRUE,lty=c(-1,-1,-1,2,1),
+       col=c("brown","dark green","black","black","black"),xpd=TRUE)
 } else {
 legend("topleft",inset = c(0,0),bty="n",legend=c("Pit","Stakes","Probes","Glacier \nOutline"),pch=c(0,8,20,NA),pt.cex=c(1.3,1,1,NA),merge=TRUE,lty=c(-1,-1,-1,1),col=c("brown","dark green","black","black"),xpd=TRUE)
 }
