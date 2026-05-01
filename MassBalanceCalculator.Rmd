@@ -31,17 +31,13 @@ Currently I decide on which stakes are the same by their location, but sometimes
 Loadlibraries
 ```{r}
 suppressPackageStartupMessages({
-  if (!require(sp)) install.packages('sp'); library(sp)
-  if (!require(dplyr)) install.packages('dplyr'); library(dplyr)
-  if (!require(ggplot2)) install.packages('ggplot2'); library(ggplot2)
-  if (!require(scales)) install.packages('scales'); library(scales)
-  if (!require(sf)) install.packages('sf'); library(sf)
-  if (!require(gstat)) install.packages('gstat'); library(gstat)
-  if (!require(automap)) install.packages('automap'); library(automap)
-  if (!require(GISTools)) install.packages('GISTools'); library(GISTools)
-  if (!require(RANN)) install.packages('RANN'); library(RANN)
-  if (!require(tools)) install.packages('tools'); library(tools)
-  if (!require(mapview)) install.packages('mapview'); library(mapview)
+list.of.packages <- c("sp","dplyr","ggplot2","scales","sf","gstat","automap","GISTools","RANN","tools","mapview","this.path")
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages,repos='https://cloud.r-project.org')
+
+librariesToLoad <- list.of.packages[!(list.of.packages %in% (.packages()))]
+if(length(librariesToLoad)) sapply(librariesToLoad, library, character.only = TRUE)
+
 })
 ```
 
@@ -109,9 +105,9 @@ Observation data
 Map data
 Spatial data
 ```{r}
-
-#ProjectDirectory <- "/media/drizzle/70DAC0494B655316/Projects/Rolleston Glacier/RollMassBal"
-ProjectDirectory <- "D:\\Projects\\Rolleston Glacier\\RollMassBal"
+#Set the working directory to the same location as this file
+setwd(this.path::this.dir())
+ProjectDirectory <- "../"
 DataDirectory <- file.path(ProjectDirectory,"data")
 GISDirectory <- file.path(ProjectDirectory,"GIS")
 
@@ -184,7 +180,7 @@ if(length(WhichVirtual) > 0){
   names(ProbeData)[WhichVirtual] <-
     paste0(names(ProbeData)[match(ProbedDates[WhichVirtual],ProbedDates[-WhichVirtual])] ,"_Virtual")   
 } else {
-  names(ProbeData)[order(ProbedDates)] <- c("EndOfWinter","EndOfSummer")[length(ProbedDates)]
+  names(ProbeData)[order(ProbedDates)] <- c("EndOfWinter","EndOfSummer")
 }
 StakeData <- read.csv(StakeFileName,stringsAsFactors = FALSE,colClasses = c("myDate","character",rep("numeric",5),"character"))
 #Limit the stake data to just the date(s) of interest, taken to be any dates before September of the mass balance year, but after the previous September
@@ -364,6 +360,7 @@ StakeDEMElevations <- terra::extract(RollestonDEM,spStakePoints,ID=FALSE)[FirstS
 #Note that this is an approximation to get around the problem of the EOSS not really being at a single elevation.
 #AblationArea <- gArea(AccumulationAblationAreas[AccumulationAblationAreas$Type=="Ablation",])
 AblationArea <- terra::expanse(AccumulationAblationAreas[AccumulationAblationAreas$Type=="Ablation",])
+AccumulationArea <- terra::expanse(AccumulationAblationAreas[AccumulationAblationAreas$Type=="Accumulation",])
 EOSSElevation <- AreaElevationCurve[which.min(abs(AreaElevationCurve$Area-AblationArea)),'Elevation']
 
 #Get the end-of-winter snow depth (in swe) for the EOSS line
@@ -466,10 +463,13 @@ paste0("Area averaged summer melt over the accumulation area of ",round(mean(Acc
 
 paste0("Area averaged annual gain over the accumulation area of ",round(mean(EOSSWERaster5mGlacier[!is.na(AccumulationAreaMelt)]),0), " mm of snow water equivalent")
 
+#AccumulationArea <- terra::expanse(AccumulationAblationAreas[AccumulationAblationAreas$Type=="Accumulation",])
+
 paste("Accumulation area size:",round(AccumulationArea/1000000,3),"km2" )
 
-mean(EOSSWERaster5mGlacier[!is.na(AccumulationAreaMelt)])/1000 * AccumulationArea / mean(AblationMelt[!is.na(AblationMelt)]) + AccumulationArea
-paste("Area of ablation area that would lead to a balanced glacier:")
+paste("Area of ablation area that would lead to a balanced glacier (km2):")
+mean(EOSSWERaster5mGlacier[!is.na(AccumulationAreaMelt)]) * AccumulationArea / mean(AblationMelt[!is.na(AblationMelt)]) /1000000
+paste("Ablation area size this year:",round(AblationArea/1000000,3),"km2")
 ```
 
 Now plot the accumulation area melt
@@ -518,6 +518,7 @@ MeanAnnualBalance <- round(mean(AnnualBalance[!is.na(AnnualBalance)]),0)
 paste0("Area averaged mass balance change of ",MeanAnnualBalance, " mm of snow water equivalent")
 
 ```
+
 ```{r}
 AnnualBalance_stars <- stars::st_as_stars(AnnualBalance)
 mapview(AnnualBalance_stars, na.color = rgb(0, 0, 0, 0, names = NULL, maxColorValue = 1),map.types = c("Esri.WorldShadedRelief", "OpenStreetMap.DE"))
@@ -587,7 +588,7 @@ TotalSummerObsInAblationArea <- PitsAblation + StakesAblation + ProbesAblation2
 MIN_NUMBER_OF_MEASUREMENT_SITES_IN_ABLATION_AREA <- min(TotalWinterObsInAblationArea ,TotalSummerObsInAblationArea)
 MAX_NUMBER_OF_MEASUREMENT_SITES_IN_ABLATION_AREA <- max(TotalWinterObsInAblationArea ,TotalSummerObsInAblationArea)
 
-AccumulationArea <- terra::expanse(AccumulationAblationAreas[AccumulationAblationAreas$Type=="Accumulation",])
+#AccumulationArea <- terra::expanse(AccumulationAblationAreas[AccumulationAblationAreas$Type=="Accumulation",])
 
 paste("MinObsInAcc:",MIN_NUMBER_OF_MEASUREMENT_SITES_IN_ACCUMULATION_AREA)
 paste("MaxObsInAcc:",MAX_NUMBER_OF_MEASUREMENT_SITES_IN_ACCUMULATION_AREA)

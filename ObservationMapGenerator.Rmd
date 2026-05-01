@@ -6,11 +6,14 @@ output: html_notebook
 This notebook has been prepared to enable preparation of a map of where observations have been taken on the Rolleston Glacier.
 Loadlibraries
 ```{r}
-if (!require(sp)) install.packages('sp'); library(sp)
-if (!require(terra)) install.packages('terra'); library(terra)
-if (!require(slippymath)) install.packages('slippymath'); library(slippymath) #needed to figure out wmts tiles
-if (!require(sf)) install.packages('sf'); library(sf) #needed to work with slippymath
-if (!require(tools)) install.packages('tools'); library(tools) #has the very useful file_ext() function
+suppressPackageStartupMessages({
+list.of.packages <- c("sp","terra","slippymath","sf","tools","this.path")
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages,repos='https://cloud.r-project.org')
+
+librariesToLoad <- list.of.packages[!(list.of.packages %in% (.packages()))]
+if(length(librariesToLoad)) sapply(librariesToLoad, library, character.only = TRUE)
+})
 ```
 
 
@@ -23,14 +26,15 @@ Spatial data
 #****************************************
 #Edit the date to match the survey date
 #***************************************
-DateOfInterest <- as.Date("2025-11-23")
+DateOfInterest <- as.Date("2026-03-17")
 
 LINZAPIToken <- "85df745fa5d446fea241dd5ae40add85"
 LINZTopo50WMSURL <- "https://data.linz.govt.nz/services;key=YOUR_API_TOKEN/wms?service=WMS&version=1.1.1&request=GetMap&layers=layer-50767&format=image/png&width=364&height=400&bbox=LonMin,LatMin,LonMax,LatMax"
-ProjectDirectory <- "/media/drizzle/70DAC0494B655316/Projects/Rolleston Glacier/RollMassBal"
 
-#Check directory exists, if it doesn't try the windows path.
-if (!dir.exists(ProjectDirectory)){ProjectDirectory <- "D:\\Projects\\Rolleston Glacier\\RollMassBal"}
+#Set the working directory to the same location as this file
+setwd(this.path::this.dir())
+
+ProjectDirectory <- "../"
 DataDirectory <- file.path(ProjectDirectory,"data")
 GISDirectory <- file.path(ProjectDirectory,"GIS")
 
@@ -56,6 +60,7 @@ StakeFileName       <- file.path(DataDirectory,"Rolleston_Stakes.csv")
 #If an EOSS snowline spatial file exists, then use it. Can be either an ESRI shapefile or a GPX file which the MapToaster iphone app can produce.
 #EOSSFileName        <- "track-2021-03-23_09-01-55.gpx"
 #EOSSFileName        <- "EOSS_20250313.shp"
+EOSSFileName        <- "EOSS_20260317.shp"
 ```
 
 Now lets load the Glacier outline, stake points, pit location, probe locations and plot them on the Topo50 map.
@@ -87,9 +92,9 @@ if(exists("EOSSFileName")){
     EOSSTrackPoints <- readGPX(file.path(GISDirectory,basename(PitAndProbeDataDirectory),EOSSFileName))[["tracks"]][[1]][[1]]
     #Convert to a spatial file
     EOSSLine <- terra:vect(as.matrix(EOSSTrackPoints[,c("lon","lat")]), type="lines",crs="epsg:4326")
-  } else if (tolower(file_ext(EOSSFileName)) == "shp"){ #if its an ESRI shapefile, process accordingly
+  } else if (tolower(file_ext(EOSSFileName)) %in% c("shp","gpkg")){ #if its an ESRI shapefile or a geopackage, process accordingly
     EOSSLine <- terra::vect(file.path(GISDirectory,basename(PitAndProbeDataDirectory),EOSSFileName)) 
-    }
+  } 
 
 } else {EOSSLine <- NULL}
 
