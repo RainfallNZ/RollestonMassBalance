@@ -124,7 +124,15 @@ CurrentYearDataDirectory <- file.path(DataDirectory,"IndividualYears",paste0(Mas
 DepthFileNameList <- list.files(path = CurrentYearDataDirectory, pattern = "Rolleston_depths_.*csv$",full.names=TRUE)
 DensityFileNameList <- list.files(path = CurrentYearDataDirectory, pattern = "Rolleston_density_.*csv$",full.names = TRUE)
 
-RollestonGlacierOutlineFile <- "Rolleston_outline_20250313_Sentinel2_NDSI.shp"
+if (MassBalanceYear < 2022) {
+  RollestonGlacierOutlineFile <- "Rolleston_outline_20090408V3.shp"
+} else if (MassBalanceYear < 2025){
+  RollestonGlacierOutlineFile <- "Rolleston_outline_20220408_Sentinel2_NDSI.shp"
+} else {
+  RollestonGlacierOutlineFile <- "Rolleston_outline_20250313_Sentinel2_NDSI.shp"
+}
+
+
 StakeFileName       <- file.path(DataDirectory,"Rolleston_Stakes.csv")
 RollestonDEMFile <- file.path(GISDirectory,"rolelevnztm")
 
@@ -189,7 +197,17 @@ StakeData <- StakeData[StakeData$Date > as.Date(paste(MassBalanceYear - 1,"09","
 
 #Convert the point data to spatial data
 # spPitPoints <- SpatialPointsDataFrame(PitData[,c("Easting.NZTM.","Northing.NZTM.")],proj4string=CRS('+init=epsg:2193'),data=PitData)
-spProbePoints <- lapply(ProbeData, function(x) {terra::vect(x, geom=c("Easting_NZTM","Northing_NZTM"), crs="epsg:2193")})
+spProbePoints <- lapply(ProbeData, function(x) {
+  #these data are to be used for Kriging, which cannot have duplicate locations,
+  # though having nearby locations is useful for calculating the nugget.
+  # So to keep the duplicates, their position is edited by 1 m in any direction
+  if(any(duplicated(x[,c("Easting_NZTM","Northing_NZTM")]))){
+    NoDuplicateCoordinates <- geoR::jitterDupCoords(x[,c("Easting_NZTM","Northing_NZTM")],max = 1, which.fix = "last")
+    #Replace the old coordinates with the new "de-duplicated" coordinates
+    x[,c("Easting_NZTM.","Northing_NZTM")] <- NoDuplicateCoordinates
+  }
+  terra::vect(x, geom=c("Easting_NZTM","Northing_NZTM"), crs="epsg:2193")
+  })
 
 spStakePoints <- terra::vect(StakeData, geom=c("E_NZTM","N_NZTM"), crs="epsg:2193")
 #Put them in a list for simplicity of later processing
@@ -239,12 +257,16 @@ EndOfWinterDepths$DEMValues <- terra::extract(RollestonDEM, EndOfWinterDepths,ID
 #future efforts should include anisotropy, in that snow depths probably generally increase up the glacier, and this could be included in the kriging consideration.
 
 #convert EndoFWinterDepths to an sf object to use it in variogram()
+#SampleVariogram <- variogram(SWE~1,sf::st_as_sf(EndOfWinterDepths),cutoff=100) #used this for 2015
 SampleVariogram <- variogram(SWE~1,sf::st_as_sf(EndOfWinterDepths),cutoff=400) #Note sometimes need to play with the cutoff value (distance around a point to consider) to get a semi variogram fit. This worked for 2021
 #SampleVariogram <- variogram(SWE~1,EndOfWinterDepths,cutoff=250) #Note sometimes need to play with the cutoff value (distance around a point to consider) to get a semi variogram fit. This worked for 2020
 #SampleVariogram <- variogram(SWE~1,EndOfWinterDepths,cutoff=150) #This worked for 2019
+#vs.fit <- fit.variogram(SampleVariogram, model=vgm(psill = 4000,"Lin",range=0,nugget = 50000),fit.method = 1) #2015 needed to use a linear model, iunder which case the psill becomes the slope, and the range is set to 0
 #vs.fit <- fit.variogram(SampleVariogram, vgm(psill=250000, "Sph", range=150,nugget=50000),fit.method = 1) #Use this and the next line to explore different options. Worked for 2020
 vs.fit <- fit.variogram(SampleVariogram, vgm(psill=1000000, "Gau", range=500,nugget=50000),fit.method= 7) #Use this and the next line to explore different options. Worked for 2019 and 2021
 #plot(SampleVariogram,vs.fit)
+#vari.model <- fit.variogram(SampleVariogram, model=vgm(psill = 250000,"Gau",range=1500,nugget = 50000),fit.method = 1)
+#vari.model <- fit.variogram(SampleVariogram, model=vgm(psill = 4000,"Lin",range=0,nugget = 50000),fit.method = 1) #2015  
 vari.model <- fit.variogram(SampleVariogram, model=vgm(psill = 1000000,"Gau",range=500,nugget = 50000),fit.method = 7) #note the use of fit.method argument as using the default fit.method meant the fitting failed to converge.
 
 #Add a "DEMValues" attribute to the Glacier Grid, so that it can be used in the kriging
@@ -511,8 +533,6 @@ terra::writeRaster(AnnualBalance,file.path(GISDirectory,
 paste0("Annual Mass Balance-",MassBalanceYear-1,"-",MassBalanceYear,".tif")),overwrite=TRUE)
 
 MeanAnnualBalance <- round(mean(AnnualBalance[!is.na(AnnualBalance)]),0)
-
-
 
 #Calculate average balance change over the glacier
 paste0("Area averaged mass balance change of ",MeanAnnualBalance, " mm of snow water equivalent")
