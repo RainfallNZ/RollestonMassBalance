@@ -87,7 +87,6 @@ DepthToDensityLUT <- function(SinglePitData) {
 
 #This function takes a snow depth and a date and the list of snow pit density data and calculates the SWE
 SnowDepthToSWE <- function(SnowDepth, Date, PitData) {
-  #browser()
   #Get the PitData index for the date of interest
   PitDataIndex <- which(sapply(PitData, function(x) x$Date[1] == Date)==TRUE)
   
@@ -115,7 +114,7 @@ IceDensity <- 917 #kilograms per cubic metre, from Patterson
 #****************************************
 #Edit the date
 #Define the mass balance year. This is the year of the end-of-summer
-MassBalanceYear <- 2026
+MassBalanceYear <- 2014
 
 #Search the data directories for the appropriate data files.
 #Currently all stake data are saved to a single file, whereas the probe and density data are saved in their own files for each survey under a directory named for the survey. 
@@ -306,10 +305,28 @@ plot(RollestonGlacierOutline,add=T)
 
 Figure out the total snow and ice melt depth for each stake location.
 This requires working through each of the stakes from the survey start time, and finding the stake from the later survey that is nearest it and how much has emerged.
-Also need to look for any intermediate re-drilling of stakes, and account for that as well (e.g. in January and 2018)
+Also need to look for any intermediate re-drilling of stakes, and account for that as well (e.g. 20th December 2016, 17th January 2018, 13th December 2020)
 ```{r}
 #Get all the survey dates
 SurveyDates <- unique(StakeData$Date)
+
+#If there are more than two survey dates, then the stakes were probably reset part way through
+#the summer.
+#If it is reset, then there should be two rows in the stake data for each stake on the date of the reset.
+#One entry gives the length of stake sticking out before re-drilling, the other entry is how much is sticking out after the re-drilling
+#The melt calculations assume that the measurement with the most stake sticking out is the pre-drill measurement, but that is not necessarily so.
+#It could be possible that a stake put in a re-drilled hole could have a lot of stake sticking out, especially if an extra length of stake had been attached. This should be double checked manually.
+#A message is printed recommending to check that the entry with the most stake sticking out really is the pre-drilled measurement. 
+if (length(SurveyDates) > 2){
+        #Assume stake resetting occured on survey dates that were not the first or the last. 
+        StakeResetDates <- SurveyDates[-c(1,length(SurveyDates))]
+        print(paste("Double check manually that for the stake reset measurements on ",StakeResetDates, 
+                 "that the measurements with the most emerged stake were all before the stake hole was re-drilled.",
+                 "Otherwise the total melt calculations will be wrong and should be done manually."))
+        print("2016-12-20, 2018-01-17 and 2020-12-13 are all OK")
+      #knitr::kable(StakeData[StakeData$Date %in% StakeResetDates,])
+}
+
 FirstStakeIndices <- which(StakeData$Date == min(SurveyDates))
 
 #Initialise TotalSurfaceLowering, and TotalSWEMelt vectors
@@ -332,14 +349,22 @@ for (StakeIndex in FirstStakeIndices){
   
   #now loop through each of these dates, gathering information as you go
   for (SurveyDate in ThisStakesSurveyDates[-1]) {
-    #Determine if the survey is a reset, or the last survey for the stake
+
+    #Determine if the survey is a reset, or the last survey for the stake.
+
     NextSurveyIndices <- SameStakeIndices[which(StakeData$Date[SameStakeIndices] == SurveyDate)]
-    if(length(NextSurveyIndices) > InitialSnowDepth) {
-      TotalSurfaceLowering[StakeIndex] <- max(StakeData$length_of_stake_emerged_mm[NextSurveyIndices]) - StakeEmergence + TotalSurfaceLowering[StakeIndex]
+   # if(length(NextSurveyIndices) > InitialSnowDepth) {
+    if(length(NextSurveyIndices) > 1) {
+      
+      TotalSurfaceLowering[StakeIndex] <- max(StakeData$length_of_stake_emerged_mm[NextSurveyIndices]) - 
+        StakeEmergence + 
+        TotalSurfaceLowering[StakeIndex]
       StakeEmergence <- min(StakeData$length_of_stake_emerged_mm[NextSurveyIndices]) 
     } else {
       #browser()
-      TotalSurfaceLowering[StakeIndex] <- StakeData$length_of_stake_emerged_mm[NextSurveyIndices] - StakeEmergence + TotalSurfaceLowering[StakeIndex]
+      TotalSurfaceLowering[StakeIndex] <- StakeData$length_of_stake_emerged_mm[NextSurveyIndices] - 
+        StakeEmergence + 
+        TotalSurfaceLowering[StakeIndex]
       FinalSnowDepth <- StakeData$Snow_Depth_m[NextSurveyIndices]
       }
   }
@@ -348,9 +373,9 @@ for (StakeIndex in FirstStakeIndices){
       #The total ice melt is the total melt depth less the first-survey snow depth * ice density
       #If there is still snow around the stake at the last survey, then the melt is all snow, but the amount is complicated as snow can compress over summer.
       #The total snow melt is the (first-survey snow depth * first-survey snow density) minus (last-survey snow depth * last-survey snow density)
-  #browser()
+
   if (TotalSurfaceLowering[StakeIndex] > InitialSnowDepth){
-    #browser()
+
     SnowMeltSWE <- SnowDepthToSWE(InitialSnowDepth*1000, min(SurveyDates),PitData = PitData)
     IceMeltSWE <- (TotalSurfaceLowering[StakeIndex] - InitialSnowDepth*1000)/1000 * IceDensity
     TotalSWEMelt[StakeIndex] <- SnowMeltSWE + IceMeltSWE
