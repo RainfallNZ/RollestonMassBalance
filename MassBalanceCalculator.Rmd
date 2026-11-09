@@ -1,12 +1,18 @@
 ---
 title: "Mass Balance Calculator"
-output: html_notebook
+output: 
+  pdf_document: default
+  html_notebook: default
 ---
 
 This notebook has been prepared to enable calculation of the mass balance of the Rolleston glacier.
+
 Snow depth measurements are collected at the end of each winter, as well as a snow density profile.
 At the end of summer more snow depth measurements are made, and another snow density profile. In addition, the  total depth of summer melt at four locations is found.
 From these observations, together with glacier extent and elevation data the mass balance values are found.
+
+End of winter accumulation interpolation uses universal kriging by default - the depth histograms and sample variogram of the residuals and the data should be visually checked to see if this is appropriate. Similarly, end of summer uses ordinary kriging by default, but the depth histograms and sample variograms need to be checked to confirm this is appropriate.
+
 The mass balance values required (for submission to the World Glacier Monitoring Service) are:
 Dates of the beginning of the survey period, the end of winter observation date, and the end-of-survey date.
 The equilibrium line elevation and uncertainty
@@ -28,10 +34,10 @@ Stuff to do:
 I need to add another field to the stake data that provides an identifier.
 Currently I decide on which stakes are the same by their location, but sometimes the GPS error is enough that I get a mix up
 
-Loadlibraries
+# Load required packages/libraries
 ```{r}
 suppressPackageStartupMessages({
-list.of.packages <- c("sp","dplyr","ggplot2","scales","sf","gstat","automap","GISTools","RANN","tools","mapview","this.path")
+list.of.packages <- c("sp","dplyr","ggplot2","scales","sf","gstat","automap","GISTools","RANN","tools","mapview","this.path", "lattice", "geoR")
 new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
 if(length(new.packages)) install.packages(new.packages,repos='https://cloud.r-project.org')
 
@@ -41,11 +47,10 @@ if(length(librariesToLoad)) sapply(librariesToLoad, library, character.only = TR
 })
 ```
 
-Define some useful functions and stuff
+# Define useful functions
 ```{r}
 #See this link to explain what the setAs is all about. I use it to predefine the date format in the StakeData.csv file I load later on. https://stackoverflow.com/questions/13022299/specify-custom-date-format-for-colclasses-argument-in-read-table-read-csv
 setAs("character","myDate", function(from) as.Date(from, format="%d/%m/%Y") )
-
 
 #The following is a function to create a depth to average density look-up-table based on some snow pit data.
 #Create a table of densities that extrapolates the observed depths down to 20 m  (which is assumed to be a maximum, who is going to probe a 20 m hole?) in 10 cm steps. The densities below the pit depth are taken as the average of the metre above.
@@ -84,7 +89,6 @@ DepthToDensityLUT <- function(SinglePitData) {
   return(DepthDensities)
 }
 
-
 #This function takes a snow depth and a date and the list of snow pit density data and calculates the SWE
 SnowDepthToSWE <- function(SnowDepth, Date, PitData) {
   #Get the PitData index for the date of interest
@@ -98,11 +102,11 @@ SnowDepthToSWE <- function(SnowDepth, Date, PitData) {
   SWE <- SnowDepth / 1000 * AverageDensity
 }
 ```
-Start by describing the various data sources:
-Set the observation date of interest
-Observation data
-Map data
-Spatial data
+
+# Define file locations, data sources and constants.
+Some files vary with the year, e.g. probe and pit data (but not stake data).
+Some data needs to be pre-prepared, e.g. the spatial accumulation/ablation area outlines, density uncertainty and area uncertainty.
+Some data only occasionally changes (e.g. glacier outlines).
 ```{r}
 #Set the working directory to the same location as this file
 setwd(this.path::this.dir())
@@ -110,11 +114,17 @@ ProjectDirectory <- "../"
 DataDirectory <- file.path(ProjectDirectory,"data")
 GISDirectory <- file.path(ProjectDirectory,"GIS")
 
-IceDensity <- 917 #kilograms per cubic metre, from Patterson 
+IceDensity <- 917 # kilograms per cubic metre, from Patterson 
 #****************************************
 #Edit the date
 #Define the mass balance year. This is the year of the end-of-summer
-MassBalanceYear <- 2014
+MassBalanceYear <- 2025
+
+# Standard deviation for density is calculated over all years (currently 2010-2026) based on Cullen et al. (2017) by a separate script (density_standard_dev.R) and hardcoded here
+EOW_density_sd_all <- 32 #kg/m3 end of winter
+EOS_density_sd_all <- 56.4 # end of summer
+# Glacier area/outline uncertainty (Paul et al., 2013)
+rel_sigma_area <- 0.036
 
 #Search the data directories for the appropriate data files.
 #Currently all stake data are saved to a single file, whereas the probe and density data are saved in their own files for each survey under a directory named for the survey. 
@@ -131,7 +141,6 @@ if (MassBalanceYear < 2022) {
   RollestonGlacierOutlineFile <- "Rolleston_outline_20250313_Sentinel2_NDSI.shp"
 }
 
-
 StakeFileName       <- file.path(DataDirectory,"Rolleston_Stakes.csv")
 RollestonDEMFile <- file.path(GISDirectory,"rolelevnztm")
 
@@ -142,33 +151,64 @@ AccumulationAblationShapefileName <- list.files(file.path(GISDirectory,paste0(Ma
 EOSSShapefileName <- list.files(file.path(GISDirectory,paste0(MassBalanceYear -1,"-",MassBalanceYear)),pattern = "^EOSS.*shp$",full.names  = TRUE)
 ```
 
-Now lets load the Glacier outline, End-Of-Summer snowline line shapefile, DEM, Accumulation/Ablation polygon shapefile, stake points, pit location and probe locations.
+# Load the spatial data, static and observed.
+ - Glacier outline, 
+ - End-Of-Summer snowline line shapefile, 
+ - DEM, 
+ - Accumulation/Ablation polygon shapefile, 
+ - stake points, 
+ - pit location and
+ - probe locations.
 ```{r,fig.height=5,fig.width=7.5}
 #Load the glacier outline and explicitly set the projection to NZTM
 RollestonGlacierOutline <- terra::vect(file.path(GISDirectory,RollestonGlacierOutlineFile)) %>% terra::project(y="epsg:2193")
 
-#Create a spatial point file of 30 m grid spacing across the glacier for use in kriging
-#GlacierGrid <- terra::vect(st_make_grid(st_as_sf(RollestonGlacierOutline), cellsize = 30, what = "centers")) %>% terra::project(y="epsg:2193")
+#Get the DEM data
+RollestonDEM <- terra::rast(RollestonDEMFile) %>% 
+  terra::project(y="epsg:2193") %>%
+  terra::crop(RollestonGlacierOutline)
 
+#Create a spatial point file of 30 m grid spacing across the glacier for use in kriging
 GlacierGrid <- st_as_sf(RollestonGlacierOutline) %>% 
   st_buffer(15) %>%
   st_make_grid(cellsize = 30, what = "centers") %>%
   terra::vect() %>%
   terra::project(y="epsg:2193")
 
+#Add a "DEMValues" attribute to the Glacier Grid, so that elevation can be used in the kriging
+GlacierGrid$DEMValues <- terra::extract(RollestonDEM, GlacierGrid,ID=FALSE)
+
 #Load the end of summer accumulation and ablation area shape file and explicitly set the projection to NZTM
-AccumulationAblationAreas <- terra::vect(AccumulationAblationShapefileName) %>% terra::project(y="epsg:2193")
+AccumulationAblationAreas <- terra::vect(AccumulationAblationShapefileName)
+# Assign CRS if missing (some older shapefiles lack a .prj file)
+if (is.na(terra::crs(AccumulationAblationAreas)) || terra::crs(AccumulationAblationAreas) == "") {
+  message("AccumulationAblationAreas has no CRS — assuming NZTM (EPSG:2193)")
+  terra::crs(AccumulationAblationAreas) <- "epsg:2193"
+} else {
+  AccumulationAblationAreas <- terra::project(AccumulationAblationAreas, y = "epsg:2193")
+}
 
 #Load the end of summer snow line shape file and explicitly set the projection to NZTM
 EOSSLine <- terra::vect(EOSSShapefileName) %>% terra::project(y="epsg:2193")
 
-#Get the DEM data
-RollestonDEM <- terra::rast(RollestonDEMFile) %>% terra::crop(RollestonGlacierOutline)
+
 
 #Get the data. Note that stake data is for all years, so is in a different directory
 PitData   <- lapply(DensityFileNameList, read.csv, stringsAsFactors = FALSE,colClasses = c("character","character","myDate",rep("numeric",6),"character"))
+
 ProbeData <- lapply(DepthFileNameList, read.csv, stringsAsFactors = FALSE,colClasses = c("character","character","character",rep("numeric",4),"character"))
+
+#Clean Probe Data to get rid of > and < signs present in some years
+ProbeData <- lapply(ProbeData, function(df) {
+  df[4:7] <- lapply(df[4:7], function(x) {
+    x <- gsub("[^0-9.-]", "", x)  # strips > < etc
+    as.numeric(x)
+  })
+  df
+})
+
 ProbedDates <- as.Date(sub("Rolleston_depths_","",file_path_sans_ext(basename(DepthFileNameList))),format="%Y%m%d")
+
 #Check that only two probing dates are involved. This assumption is required for some of the subsequent analysis.
 #If more than 2 probing dates, then some manual calculations are needed.
 if (length(unique(ProbedDates))> 2)print("More than two probing dates in a year. Need to manually figure it all out!!")
@@ -195,7 +235,6 @@ StakeData <- StakeData[StakeData$Date > as.Date(paste(MassBalanceYear - 1,"09","
                          StakeData$Date < as.Date(paste(MassBalanceYear,"09","01"),"%Y %m %d"),]
 
 #Convert the point data to spatial data
-# spPitPoints <- SpatialPointsDataFrame(PitData[,c("Easting.NZTM.","Northing.NZTM.")],proj4string=CRS('+init=epsg:2193'),data=PitData)
 spProbePoints <- lapply(ProbeData, function(x) {
   #these data are to be used for Kriging, which cannot have duplicate locations,
   # though having nearby locations is useful for calculating the nugget.
@@ -209,8 +248,6 @@ spProbePoints <- lapply(ProbeData, function(x) {
   })
 
 spStakePoints <- terra::vect(StakeData, geom=c("E_NZTM","N_NZTM"), crs="epsg:2193")
-#Put them in a list for simplicity of later processing
-# ObservedData <- list(PitPoints = spPitPoints, ProbePoints = spProbePoints, StakePoints = spStakePoints, Outline = RollestonGlacierOutline)
 
 #Get the extents of the glacier in lat lon
 GlacierExtentLatLon <- terra::project(RollestonGlacierOutline, y='epsg:4326') %>% terra::ext()
@@ -218,6 +255,8 @@ GlacierExtentLatLon <- terra::project(RollestonGlacierOutline, y='epsg:4326') %>
 #Expand the extents to provide extents for the topographical map to download
 MapExtents <- GlacierExtentLatLon + 0.005
 ```
+
+# Hypsometric curve
 This chunk takes the DEM and develops an area-elevation hypsometric curve.
 ```{r}
 #Clip the DEM to the Rolleston Glacier area
@@ -240,22 +279,171 @@ AreaElevationCurve <- data.frame(Area = BinAreaBelow, Elevation = BinElevations)
 #Plot it to have a look
 plot(AreaElevationCurve,typ="l")
 ```
+
+# End of Winter Snow Water Equivalent Interpolation
 Calculate the end of winter snow water equivalent by interpolating snow depth measurements (converted to SWE using density observations)  using kriging across the glacier domain. 
+
+Start by:
+ - removing duplicates,
+ - converting the end of winter snow depths to SWE.
+ - getting the elevation for each point, 
+ - removing any NA's and 
+ - converting the resulting end of winter SWE data to an sf object.
 ```{r}
 #Get the end of winter snow depths
 EndOfWinterDepths <- spProbePoints[["EndOfWinter"]]
 
-#remove any duplicate coordinates otherwise the Kriging results in NA's see https://gis.stackexchange.com/questions/250862/r-kriging-cross-validation-returns-na-for-all-prediction-points
+#remove any duplicate coordinates otherwise the Kriging results in NA's see https://gis.stackexchange.com/questions/250862/r-kriging-cross-validation-returns-na-for-all-prediction-points.
+#There shouldn't be any duplicates as duplicates were "jittered" earlier on. Jittering is a better approach than removing duplicates as it retains nearby data that helps determine the variability at small distances, which is needed for the variogram.
 EndOfWinterDepths = terra::unique(EndOfWinterDepths)
 
-#Convert to snow water equivalent using the pit data
+#Convert to snow water equivalent in mm using the pit data and SWE function
 EndOfWinterDepths$SWE <- SnowDepthToSWE(EndOfWinterDepths$Snow_Depth_m*1000, min(ProbedDates),PitData = PitData) 
 
+#Extract elevation from DEM for each probe point
 EndOfWinterDepths$DEMValues <- terra::extract(RollestonDEM, EndOfWinterDepths,ID=FALSE)
 
-#future efforts should include anisotropy, in that snow depths probably generally increase up the glacier, and this could be included in the kriging consideration.
+#Get rid of na values
+EndOfWinterDepths <- EndOfWinterDepths[
+  !is.na(EndOfWinterDepths$SWE) &
+  !is.na(EndOfWinterDepths$DEMValues),
+]
 
 #convert EndoFWinterDepths to an sf object to use it in variogram()
+eow_depths_sf = sf::st_as_sf(EndOfWinterDepths) 
+```
+
+
+Check whether the data are normally distributed.
+Check if there is a trend related to elevation.
+This is needed to decide if ordinary or universal kriging should be used.
+Ordinary kriging assumes there is no spatial trend, Universal kriging assumes a systematic trend.
+Need an objective threshold of how "normal" the distribution needs to be before ordinary kriging is acceptable. Currently assessment is subjective.
+Similarly, how "normal" do the residuals from the elevation relationship need to be for Universal kriging to be acceptable.
+```{r}
+#Check for skew
+hist(EndOfWinterDepths$SWE)
+
+# check if there is a trend in SWE with elevation
+plot(eow_depths_sf$DEMValues, eow_depths_sf$SWE,
+     xlab = "Elevation (m)",
+     ylab = "SWE (mm)")
+abline(lm(SWE ~ DEMValues, data = eow_depths_sf))
+
+#fit a trend model, plot the histogram of the residuals
+elev_mod <- lm(SWE ~ DEMValues, data = eow_depths_sf)
+eow_depths_sf$resid <- residuals(elev_mod)
+hist(eow_depths_sf$resid)
+```
+
+Check whether there is any directional trend (i.e. anisotropy).
+This is currently ignored as the later kriging does not (yet) consider anisotropy
+```{r, eval=FALSE}
+#Check for anisotropy - plot the semivariogram in four dirctions and see if it changes
+anis_test <- variogram(SWE ~ 1,eow_depths_sf, cutoff=200, alpha = 80,tol.hor = 20)
+plot(anis_test)
+```
+
+Plot variograms with and without considering the elevation trend.
+If they are subjectively the same then, consider ordinary kriging.
+The lower the semivariance the better, so if one plots lower than the other, it is the one to use.
+Usually kriging the residuals will have lower semivariance, but maybe not always...
+```{r}
+#Cutoff heuristic - get coordinates, calculate max distance between any two points for variogram cutoff based on https://rpubs.com/Dr_Gurpreet/spatial_interpolation_kriging_R
+coords <- terra::crds(EndOfWinterDepths)
+dists <- dist(coords)
+max_dist <- max(dists)
+cutoff <- max_dist / 2
+
+#generate experimental/sample variogram from residuals after removing elevation trend. 
+SampleVariogram <- variogram(SWE ~ DEMValues,eow_depths_sf, cutoff = cutoff) 
+
+#compare residual variogram to variogram plotted from the data 
+SampleVariogram_ordinary <- variogram(SWE ~ 1, eow_depths_sf, cutoff = cutoff,alpha = 80,tol.hor = 20)
+
+#Plot on one graph
+# Set axis limits
+xlim <- range(c(SampleVariogram$dist,SampleVariogram_ordinary$dist))
+ylim <- range(c(SampleVariogram$gamma,SampleVariogram_ordinary$gamma))
+
+# Create plot
+plot(SampleVariogram$dist,
+     SampleVariogram$gamma,
+     col = "blue",
+     xlim = xlim,
+     ylim = ylim,
+     xlab = "Distance",
+     ylab = "Semivariance",
+     main="Sample Variograms EOW")
+
+# Add second variogram
+points(SampleVariogram_ordinary$dist,
+       SampleVariogram_ordinary$gamma,
+       col = "red")
+
+legend("topleft",
+       legend = c("Residuals", "Ordinary"),
+       col = c("blue", "red"),
+       pch = c(1, 1))
+```
+
+Test variogram models - currently only testing spherical, gaussian and exponential.
+
+Universal kriging is then applied using best the fit model.
+This needs editing if Ordinary kriging directly on SWE values are to be used, based on previous tests that might show the data are normally distributed and the semi-variogram is no worse than the residuals one.
+```{r}
+#see examples of vgm models:
+#show.vgms()
+
+#choosing start sill, nugget and range values. these work because fit.variogram() optimises these and needs a reasonable starting point. check that these look realistic on plotted sample variogram
+nugget.start <- SampleVariogram$gamma[1]
+total.sill <- max(SampleVariogram$gamma)
+psill.start <- total.sill - nugget.start
+range.start <- max(SampleVariogram$dist)/2
+
+#fitting different models to compare. gaussian unlikely to be any good?
+#fit.variogram only optimises sill/range/nugget, anisotropy values are fixed.
+sph.fit <- fit.variogram(
+  SampleVariogram,
+  vgm(psill=psill.start, "Sph", range=range.start, nugget=nugget.start),
+  fit.method=7
+)
+
+exp.fit <- fit.variogram(
+  SampleVariogram,
+  vgm(psill=psill.start, "Exp", range=range.start, nugget=nugget.start),
+  fit.method=7
+)
+
+gau.fit <- fit.variogram(
+  SampleVariogram,
+  vgm(psill=psill.start, "Gau", range=range.start, nugget=nugget.start),
+  fit.method=7
+)
+
+#plot to visually compare - check that whichever model is automatically selected looks reasonable
+plot(SampleVariogram, sph.fit, main="sph")
+plot(SampleVariogram, exp.fit, main="exp")
+plot(SampleVariogram, gau.fit, main="gau")
+
+# Collect the SSErr values, pick the best model (lowest weighted residual sum of squares)
+sserr <- c(Sph=attr(sph.fit, "SSErr"), Exp=attr(exp.fit, "SSErr"), Gau=attr(gau.fit, "SSErr"))
+best_model_name <- names(which.min(sserr))
+message("Auto-selected model: ", best_model_name)
+vari.model <- list(Sph=sph.fit, Exp=exp.fit, Gau=gau.fit)[[best_model_name]]
+
+#Universal kriging. Using 12 points at a time. Spatial data needs to be an sf object. 
+#Point kriging onto the grid, predicts SWE and variance at each cell
+KrigedSWE <- krige(SWE~DEMValues,locations=eow_depths_sf,newdata=sf::st_as_sf(GlacierGrid),model=vari.model, nmax=12)
+
+#Ordinary kriging - uncomment the following line
+#KrigedSWE <- krige(SWE~1,locations=eow_depths_sf,newdata=sf::st_as_sf(GlacierGrid),model=vari.model, nmax=12)
+
+```
+
+The following chunk is now redundant and is not to be run.
+It was used prior to Kiri showing that universal kriging is generally better, and that consideration of the normality of the observations, relationship of snSWE to elevation is needed, and testing the variogram models is needed each year to decide on the appropriate kriging approach, rather than blindly unleashing the kriging.
+```{r, eval=FALSE}
 #SampleVariogram <- variogram(SWE~1,sf::st_as_sf(EndOfWinterDepths),cutoff=100) #used this for 2015
 SampleVariogram <- variogram(SWE~1,sf::st_as_sf(EndOfWinterDepths),cutoff=400) #Note sometimes need to play with the cutoff value (distance around a point to consider) to get a semi variogram fit. This worked for 2021
 #SampleVariogram <- variogram(SWE~1,EndOfWinterDepths,cutoff=250) #Note sometimes need to play with the cutoff value (distance around a point to consider) to get a semi variogram fit. This worked for 2020
@@ -268,17 +456,20 @@ vs.fit <- fit.variogram(SampleVariogram, vgm(psill=1000000, "Gau", range=500,nug
 #vari.model <- fit.variogram(SampleVariogram, model=vgm(psill = 4000,"Lin",range=0,nugget = 50000),fit.method = 1) #2015  
 vari.model <- fit.variogram(SampleVariogram, model=vgm(psill = 1000000,"Gau",range=500,nugget = 50000),fit.method = 7) #note the use of fit.method argument as using the default fit.method meant the fitting failed to converge.
 
-#Add a "DEMValues" attribute to the Glacier Grid, so that it can be used in the kriging
-GlacierGrid$DEMValues <- terra::extract(RollestonDEM, GlacierGrid,ID=FALSE)
-
 #The actual kriging. Just using 12 points at a time. Spatial data needs to be an sf object
 KrigedSWE <- krige(SWE~1,locations=sf::st_as_sf(EndOfWinterDepths),newdata=sf::st_as_sf(GlacierGrid),model=vari.model,nmax=12)
+```
 
+Plot the interpolated end of winter snow water equivalent
+```{r}
 #Prepare a raster grid to convert the points to. 
 #r <- terra::rast(terra::ext(RollestonGlacierOutline), resolution= 30, crs = terra::crs(KrigedSWE))
-r <- (terra::ext(RollestonGlacierOutline) + 15) %>%
-  terra::rast(resolution= 30, crs = terra::crs(KrigedSWE))
-EOWSWERaster <- terra::rasterize(KrigedSWE,r,field='var1.pred')
+r <- (terra::ext(RollestonGlacierOutline) + 60) %>%
+  terra::rast(resolution= 30, crs = terra::crs(RollestonGlacierOutline))
+
+KrigedSWE_v <- terra::vect(KrigedSWE) %>%
+  terra::project(terra::crs(RollestonGlacierOutline))
+EOWSWERaster <- terra::rasterize(KrigedSWE_v,r,field='var1.pred')
 
 #Resample to 5 m and align with the DEM grid
 EOWSWERaster5m <- terra::resample(EOWSWERaster, RollestonDEM)
@@ -286,23 +477,107 @@ EOWSWERaster5m <- terra::resample(EOWSWERaster, RollestonDEM)
 #Clip to the glacier outline
 EOWSWERaster5mGlacier <- terra::mask(EOWSWERaster5m,RollestonGlacierOutline)
 
-#Save a copy for external use
-terra::writeRaster(EOWSWERaster5mGlacier,file.path(GISDirectory,paste0("EOW-Gain",format(min(StakeData$Date),"%Y%m%d"),".tif")),overwrite=TRUE)
+#Save a copy for external use -k suffix for Kiri, indicating change associated with Kiri improvements
+terra::writeRaster(EOWSWERaster5mGlacier,file.path(GISDirectory,paste0("EOW-Gain-k",format(min(StakeData$Date),"%Y%m%d"),".tif")),overwrite=TRUE)
 
 #Winter accumulation
 WinterAccumulation <- round(mean(EOWSWERaster5mGlacier[!is.na(EOWSWERaster5mGlacier)]),0)
 
 #Winter average snow
 paste0("Area averaged winter accumulation of ",WinterAccumulation, " mm of snow water equivalent")
-```
-Plot the interpolated snow water equivalent
-```{r}
+
 {
 plot(EOWSWERaster5mGlacier,main="End of winter snow water equivalent (mm)")
 plot(RollestonGlacierOutline,add=T)
 }
 ```
 
+Assess kriging results using leave one out cross validation: each observation is removed, predicted using the remaining data, and compared to the observed value
+This tells us how well the kriging predictions match reality at sampled locations.
+```{r}
+#leave out out cross validation (cv)
+cv <- krige.cv(SWE~DEMValues,locations=eow_depths_sf,model=vari.model,nmax=12,debug.level=0)
+
+#plot cv results. dashed line is 1:1 line
+cv_df <- data.frame(
+  observed = cv$observed,
+  predicted = cv$var1.pred
+)
+ggplot(cv_df, aes(x = observed, y = predicted)) +
+  geom_point() +
+  geom_smooth(method = "lm", color = "red", se = FALSE) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  coord_equal() +
+  xlab("Observed SWE (mm w.e.)") +
+  ylab("Predicted SWE (mm w.e.)")+ggtitle("Cross validation results EOW")
+```
+
+Uncertainty calculations
+It is assumed that depth errors from probing are captured by the variogram nugget and have no bias.
+I haven't considered errors from the glacier outline, EOSS line, GPS error
+```{r}
+# error calculations from leave one out cross validation results
+ME <- mean(cv$residual) # Bias
+RMSE <- sqrt(mean(cv$residual^2)) # Overall prediction error magnitude.
+MSDR <- mean((cv$residual^2) / cv$var1.var) # If ~1, kriging variance is a reliable measure of uncertainty, if >1, kriging is underestimating, if <1, kriging is overestimating uncertainty
+
+paste0("Mean error: ", sprintf("%.2f", ME), " (mm w.e.)") 
+paste0("Root mean squared error: ", sprintf("%.2f", RMSE), " (mm w.e.)") 
+paste0("Mean squared deviation ratio: ", sprintf("%.2f", MSDR))
+
+# Kriging variance raster (rasterise, resample to 5m, crop to glacier extent)
+EOWSWEVarRaster <- terra::rasterize(KrigedSWE_v, r, field = 'var1.var')
+EOWSWEVarRaster5m <- terra::resample(EOWSWEVarRaster, RollestonDEM)
+EOWSWEVarRaster5mGlacier <- terra::mask(EOWSWEVarRaster5m, RollestonGlacierOutline)
+
+# Convert prediction variance (mm2 w.e.) to kriging standard deviation (mm w.e., same as SWE)
+EOWSWESERaster5mGlacier <- sqrt(EOWSWEVarRaster5mGlacier)
+
+# Plot kriging error for EOW SWE with probe locations
+{
+plot(EOWSWESERaster5mGlacier,
+     main = "EOW Kriging Standard Deviation (mm w.e.)",
+     col = hcl.colors(100, "YlOrRd"),
+     legend = TRUE)
+plot(RollestonGlacierOutline, add = T)
+plot(EndOfWinterDepths, add=T)
+}
+
+# Root mean square (RMS) kriging standard error over the glacier. 
+# This summarises the average pixel-scale interpolation uncertainty
+sigma_EOW_krig    <- sqrt(mean(EOWSWEVarRaster5mGlacier[], na.rm = TRUE))
+
+# Uncertainty from assumption of uniform density profile
+# Get EOW pit by filtering on survey month, then get the LUT and extract average density at maximum pit depth. 
+EOWPitData <- PitData[[which(sapply(PitData, function(x) {
+  as.integer(format(as.Date(x[1, 3], format = "%d/%m/%Y"), "%m")) %in% 10:12 # October to December for EOW pit
+}))]]
+EOWPitLUT  <- DepthToDensityLUT(EOWPitData)
+EOWMaxDepth <- max(EOWPitData[, 8], na.rm = TRUE)   # column 8 is depth to bottom
+EOW_density_mean <- EOWPitLUT$AveDensity[EOWPitLUT$Depth == EOWMaxDepth]
+
+# Pixel-level uncertainty (mm we)
+sigma_bw_density_raster <- (EOWSWERaster5mGlacier / EOW_density_mean) * EOW_density_sd_all
+sigma_bw_combined <- sqrt(EOWSWEVarRaster5mGlacier + sigma_bw_density_raster^2)
+
+# Glacier-wide combined uncertainty 
+sigma_Bw_density <- sqrt(mean(sigma_bw_density_raster[]^2, na.rm = TRUE))
+sigma_Bw_total <- sqrt(mean(sigma_bw_combined[]^2, na.rm = TRUE))
+
+paste0("σ kriging: ", sprintf("%.0f", sigma_EOW_krig), " mm w.e.")
+paste0("σ density: ", sprintf("%.0f", sigma_Bw_density), " mm w.e.")
+paste0("σ total (combined): ", sprintf("%.0f", sigma_Bw_total), " mm w.e.")
+
+# Uncertainty contributions
+var_krig    <- mean(EOWSWEVarRaster5mGlacier[],      na.rm = TRUE)
+var_density <- mean(sigma_bw_density_raster[]^2,     na.rm = TRUE)
+total_var   <- var_krig + var_density
+
+paste0(sprintf("Kriging uncertainty contribution:  %.1f%%", 100 * var_krig    / total_var))
+paste0(sprintf("Density uncertainty contribution:  %.1f%%", 100 * var_density / total_var))
+```
+
+# End of summer (EOS) ablation area interpolation
 Figure out the total snow and ice melt depth for each stake location.
 This requires working through each of the stakes from the survey start time, and finding the stake from the later survey that is nearest it and how much has emerged.
 Also need to look for any intermediate re-drilling of stakes, and account for that as well (e.g. 20th December 2016, 17th January 2018, 13th December 2020)
@@ -374,7 +649,7 @@ for (StakeIndex in FirstStakeIndices){
       #If there is still snow around the stake at the last survey, then the melt is all snow, but the amount is complicated as snow can compress over summer.
       #The total snow melt is the (first-survey snow depth * first-survey snow density) minus (last-survey snow depth * last-survey snow density)
 
-  if (TotalSurfaceLowering[StakeIndex] > InitialSnowDepth){
+  if (TotalSurfaceLowering[StakeIndex] > InitialSnowDepth * 1000){
 
     SnowMeltSWE <- SnowDepthToSWE(InitialSnowDepth*1000, min(SurveyDates),PitData = PitData)
     IceMeltSWE <- (TotalSurfaceLowering[StakeIndex] - InitialSnowDepth*1000)/1000 * IceDensity
@@ -403,6 +678,9 @@ The total melt is then calculated.
 #Get the elevation of the stakes by sampling the DEM at the stake locations
 StakeDEMElevations <- terra::extract(RollestonDEM,spStakePoints,ID=FALSE)[FirstStakeIndices,]
 
+# Normalise column name for backwards compatibility - these are different between years in the input data
+area_type_col <- if ("Type" %in% names(AccumulationAblationAreas)) "Type" else "AreaType"
+
 #Get the elevation of the EOSS. This is done by finding the area of the end-of-summer ablation area, and then reading off the elevation from the area-elevation hypsometric curve created earlier.
 #Note that this is an approximation to get around the problem of the EOSS not really being at a single elevation.
 #AblationArea <- gArea(AccumulationAblationAreas[AccumulationAblationAreas$Type=="Ablation",])
@@ -420,9 +698,8 @@ MeltElevationModel <- lm(melt ~ elevation, list(melt = c(TotalSWEMelt,EOSSMelt),
 MeltRaster <- MeltElevationModel$coefficients[2]* GlacierDEM + MeltElevationModel$coefficients[1]
 
 #Restrict to the ablation area
-#Next line is for backwards compatability of column names in the AccumulationAblation spatial data
-if ("AreaType" %in% names(AccumulationAblationAreas)) AccumulationAblationAreas@data <- rename(AccumulationAblationAreas@data, Type = AreaType)
 AblationMelt <- terra::mask(MeltRaster,AccumulationAblationAreas[AccumulationAblationAreas$Type=="Ablation",])
+
 #Calculate average melt over the ablation area
 paste0("Area averaged summer melt over the ablation area of ",round(mean(AblationMelt[!is.na(AblationMelt)]),0), " mm of snow water equivalent")
 ```
@@ -434,22 +711,109 @@ plot(AblationMelt, main = "Ablation Area Summer Melt")
 plot(AccumulationAblationAreas,add=T)
 }
 ```
+Estimate uncertainty for ablation area. This is going to be the dominant uncertainty in the mass balance calculation because we are extraplotating a linear trend from very few points across the ablation area.
+```{r}
+# Get the elevation from every cell in the DEM into a dataframe so it can be fed into predict()
+DEM_df <- data.frame(elevation = terra::values(GlacierDEM, na.rm = FALSE))
+names(DEM_df) <- "elevation"
+
+# Feed every elevation through the melt elevation linear model and get standard error of the predicted mean melt for every elevation
+Predictions <- predict(MeltElevationModel, newdata = DEM_df, se.fit = TRUE)
+
+# Build standard error raster matching the DEM grid, mask to the ablation area
+MeltSERaster <- GlacierDEM
+terra::values(MeltSERaster) <- Predictions$se.fit
+AblationMeltSE <- terra::mask(MeltSERaster, AccumulationAblationAreas[AccumulationAblationAreas[[area_type_col]] == "Ablation",])
+
+# Combine the per-pixel standard error values into one ablation area uncertainty 
+sigma_Bs_ablation_regression <- sqrt(mean(AblationMeltSE[]^2, na.rm = TRUE))
+
+# Pixel-level uncertainty (mm w.e.) from assumption of uniform density profile:
+
+# Get initial winter SWE at each pixel, masked to ablation area. Then split predicted melt into snow-derived and ice-derived components
+EOWSWERaster_resampled <- terra::resample(EOWSWERaster, GlacierDEM, method = "bilinear") # need to resample EOWSWERaster onto same grid as AblationMelt
+InitialSWE_raster <- terra::mask(EOWSWERaster_resampled, AccumulationAblationAreas[AccumulationAblationAreas[[area_type_col]] == "Ablation",]) #Mask to ablation area
+MeltFromSnowSWE <- min(AblationMelt, InitialSWE_raster) # how much melted, capped at how much snow there was
+MeltFromIceSWE  <- max(AblationMelt - InitialSWE_raster, 0) # whatever is leftover after snow melt is ice
+
+# Get EOS pit by filtering on survey month, then get the LUT and extract average density at maximum pit depth. 
+EOSPitData <- PitData[[which(sapply(PitData, function(x) {
+  as.integer(format(as.Date(x[1, 3], format = "%d/%m/%Y"), "%m")) %in% 2:4 # February to April for EOS pit
+}))]]
+EOSPitLUT  <- DepthToDensityLUT(EOSPitData)
+EOSMaxDepth <- max(EOSPitData[, 8], na.rm = TRUE)
+EOS_density_mean <- EOSPitLUT$AveDensity[EOSPitLUT$Depth == EOSMaxDepth]
+
+# Snow/firn density uncertainty, ice density uncertainty assumed negligible (SD = 0)
+sigma_snow_density_raster <- (MeltFromSnowSWE / EOS_density_mean) * EOS_density_sd_all
+sigma_ice_density_raster <- (MeltFromIceSWE / IceDensity) * 0
+
+# Combined density uncertainty raster
+sigma_Bs_ablation_density_raster <- sqrt(sigma_snow_density_raster^2 + sigma_ice_density_raster^2)
+
+# Pixel-level combined uncertainty (mm w.e.) from density and regression
+# AblationMeltSE is a standard error (from predict se.fit), not variance, so square it first
+sigma_Bs_ablation_combined <- sqrt(AblationMeltSE^2 + sigma_Bs_ablation_density_raster^2)
+
+# Ablation area combined uncertainty
+sigma_Bs_ablation_density <- sqrt(mean(sigma_Bs_ablation_density_raster[]^2, na.rm = TRUE))
+sigma_Bs_ablation_total   <- sqrt(mean(sigma_Bs_ablation_combined[]^2,       na.rm = TRUE))
+
+paste0("σ regression: ", sprintf("%.0f", sigma_Bs_ablation_regression), " mm w.e.")
+paste0("σ density: ",    sprintf("%.0f", sigma_Bs_ablation_density),    " mm w.e.")
+paste0("σ total (combined): ", sprintf("%.0f", sigma_Bs_ablation_total), " mm w.e.")
+
+# Uncertainty contributions
+var_regression_Bs <- mean(AblationMeltSE[]^2,                       na.rm = TRUE)
+var_density_Bs     <- mean(sigma_Bs_ablation_density_raster[]^2,     na.rm = TRUE)
+total_var_Bs        <- var_regression_Bs + var_density_Bs
+
+paste0(sprintf("Regression uncertainty contribution: %.1f%%", 100 * var_regression_Bs/total_var_Bs))
+paste0(sprintf("Density uncertainty contribution:    %.1f%%", 100 * var_density_Bs/total_var_Bs))
+
+# Plot combined uncertainty
+{
+plot(sigma_Bs_ablation_combined,
+     main = "Combined EOS Melt Uncertainty - Ablation Area (mm w.e.)",
+     col  = hcl.colors(100, "YlOrRd"),
+     legend = TRUE)
+plot(RollestonGlacierOutline, add = TRUE)
+plot(AccumulationAblationAreas, add = TRUE)
+plot(spStakePoints[FirstStakeIndices, ], add = TRUE)
+}
+
+```
+
+
+# End of Summer accumulation area interpolation
 The summer snow interpolation should include zero values on the edge of the accumulation area that is not on the edge of the glacier.
 Interpolate the end-of-summer snow depth observations in a similar manner to the end-of-winter ones, except include the EOSS values as 0. This requires use of the end-of-summer-snowline.
 Once completed, subtract the end-of-summer values from the end-of-winter values to find the total melt over summer. Clip this to the accumulation area. Combine this with the ablation area data to get the total summer melt.
 
 In 2025, only one line of snow depths were made, with the assumption that the depth profile was similar near the headwall along the glacier. For this assumption to be included in the snow depth interpolation, a snow depth "virtual" file was created. This created "virtual" snow depths based on expert opinion of what the snow depth was likely to have been. These data need to be used for the snow depth interpolation.
+
+Create a flag for years with no summer probe data because of no remaining snow
 ```{r}
-#Load the end of summer snowline
+# 2018 has no probe data. Check before doing anything else.
+eos_no_data <- is.null(spProbePoints[["EndOfSummer"]])
 
-#Sample along the End-Of-Summer-Snowline at 20 m intervals.
+if (eos_no_data) {
+  EOSSWERaster5mGlacier <- terra::mask(
+    GlacierDEM - GlacierDEM,
+    AccumulationAblationAreas[AccumulationAblationAreas[[area_type_col]] == "Accumulation", ]
+  )
+  message("No end-of-summer probe data — accumulation area set to zero SWE. Skip kriging chunks.")
+}
+```
+
+Prepare data for kriging
+```{r}
+#reminder to not try to calculate end of summer snow if there were no snow depth measurements at the end of summer
+if (eos_no_data) stop("No data year — do not run this chunk.")
+
+#Sample along the End-Of-Summer-Snowline at 20 m interval and make these zero values
 EOSSSampleSize <- floor(terra::perim(EOSSLine)/20)
-#EOSSSamples <- spsample(EOSSLine, type = "regular", n=EOSSSampleSize)
-#EOSSSample <- SpatialPointsDataFrame(EOSSSamples, data.frame(SWE=rep(0,length(EOSSSamples))))
 
-#The following is not implemented yet (as of 2024)
-#EOSSSample <- terra::spatSample(EOSSLine,size = EOSSSampleSize, method = "regular")
-#EOSSSample <- st_line_sample(sf::st_as_sf(EOSSLine), n = EOSSSampleSize, type = "regular") %>% terra::vect() %>% terra::disagg()
 EOSSSample <- sf::st_as_sf(EOSSLine) %>%
   st_cast(to="LINESTRING",warn=FALSE) %>%
   st_line_sample(n = EOSSSampleSize, type = "regular") %>%
@@ -469,38 +833,166 @@ if ("EndOfSummer_Virtual" %in% names(ProbeData)){
 
 #Some years there is no end-of-summer probes because there is not much snow (e.g. 2018), so only interpolate if they exist
 if (!is.null(EndOfSummerDepths)){
-#Convert to snow water equivalent using the pit data
-EndOfSummerDepths$SWE <- SnowDepthToSWE(EndOfSummerDepths$Snow_Depth_m*1000, max(ProbedDates),PitData = PitData)
+  #Convert depths to snow water equivalent using the pit density data
+  EndOfSummerDepths$SWE <- SnowDepthToSWE(EndOfSummerDepths$Snow_Depth_m*1000, max(ProbedDates),PitData = PitData)
+  
+  #Combine the EOSS points (set to 0), with the snow depth observations
+  EndOfSummerDepthsAndEOSS <- terra::union(EOSSSample,EndOfSummerDepths)
+  #EndOfSummerDepthsAndEOSS <- EndOfSummerDepths
+  
+  #Need to get rid of any duplicate locations
+  EndOfSummerDepthsAndEOSS <- terra::unique(EndOfSummerDepthsAndEOSS)
+  
+  #Add DEM values to EndOfSummerDepthsAndEOSS
+  EndOfSummerDepthsAndEOSS$DEMValues <- terra::extract(
+    RollestonDEM, EndOfSummerDepthsAndEOSS, ID = FALSE)
+  
+  # Turn into an sf object for kriging and get rid of NA values
+  eos_depths_sf <- sf::st_as_sf(EndOfSummerDepthsAndEOSS)
+  eos_depths_sf <- eos_depths_sf[!is.na(eos_depths_sf$SWE) & !is.na(eos_depths_sf$DEMValues), ]
+}
+```
 
-#Combine the EOSS points (set to 0), with the snow depth observations
-EndOfSummerDepthsAndEOSS <- terra::union(EOSSSample,EndOfSummerDepths)
-#EndOfSummerDepthsAndEOSS <- EndOfSummerDepths
+Estimate spatial trend and normality to see if ordinary or universal kriging is appropriate. If there is no skew and there isn't a trend in SWE with elevation, use ordinary kriging.
+```{r}
+if (!is.null(EndOfSummerDepths)){
+  
+  #Check for skew
+  hist(EndOfSummerDepthsAndEOSS$SWE)
+  
+  # check if there is a trend in SWE with elevation
+  plot(eos_depths_sf$DEMValues, eos_depths_sf$SWE,
+       xlab = "Elevation (m)",
+       ylab = "SWE (mm)")
+  abline(lm(SWE ~ DEMValues, data = eos_depths_sf))
+  
+  #fit a trend model, plot the histogram of the residuals
+  elev_mod <- lm(SWE ~ DEMValues, data = eos_depths_sf)
+  eos_depths_sf$resid <- residuals(elev_mod)
+  hist(eos_depths_sf$resid)
+}
+```
 
-#Need to get rid of any duplicate locations
-EndOfSummerDepthsAndEOSS <- terra::unique(EndOfSummerDepthsAndEOSS)
+Plot sample/experimental variograms - one ordinary, and one with the residuals after removing elevation trend. The variance explained by the elevation trend is the difference between the two curves. If the curves are the same, can use ordinary kriging.
+```{r}
+if (!is.null(EndOfSummerDepths)){
+  
+  #Cutoff heuristic - same as EOW
+  coords <- terra::crds(EndOfSummerDepthsAndEOSS)
+  dists <- dist(coords)
+  max_dist <- max(dists)
+  cutoff <- max_dist / 2
+  
+  #generate experimental/sample variogram from residuals after removing elevation trend. 
+  SampleVariogram <- variogram(SWE ~ DEMValues,eos_depths_sf, cutoff = cutoff) 
+  
+  #compare residual variogram to variogram plotted from the data 
+  SampleVariogram_ordinary <- variogram(SWE ~ 1, eos_depths_sf, cutoff = cutoff)
+  
+  #Plot on one graph
+  # Set axis limits
+  xlim <- range(c(SampleVariogram$dist,SampleVariogram_ordinary$dist))
+  ylim <- range(c(SampleVariogram$gamma,SampleVariogram_ordinary$gamma))
+  
+  # Create plot
+  plot(SampleVariogram$dist,
+       SampleVariogram$gamma,
+       col = "blue",
+       xlim = xlim,
+       ylim = ylim,
+       xlab = "Distance",
+       ylab = "Semivariance",
+       main="Sample Variograms EOS")
+  
+  # Add second variogram
+  points(SampleVariogram_ordinary$dist,
+         SampleVariogram_ordinary$gamma,
+         col = "red")
+  
+  legend("topleft",
+         legend = c("Residuals", "Ordinary"),
+         col = c("blue", "red"),
+         pch = c(1, 1))
+}
+```
 
-SampleVariogram <- variogram(SWE~1,sf::st_as_sf(EndOfSummerDepthsAndEOSS))
+Plot variograms for comparison and krige using ordinary kriging - can change this if there is a trend in SWE with elevation
+```{r}
+if (is.null(EndOfSummerDepths)) stop("No data year — do not run this chunk.")
+  
+  #fitting different models to compare. gaussian unlikely to be any good?
+  #fit.variogram only optimises sill/range/nugget, anisotropy values are fixed.
+  sph.fit <- fit.variogram(
+    SampleVariogram_ordinary,
+    vgm(psill=psill.start, "Sph", range=range.start, nugget=nugget.start),
+    fit.method=7
+  )
+  
+  exp.fit <- fit.variogram(
+    SampleVariogram_ordinary,
+    vgm(psill=psill.start, "Exp", range=range.start, nugget=nugget.start),
+    fit.method=7
+  )
+  
+  gau.fit <- fit.variogram(
+    SampleVariogram_ordinary,
+    vgm(psill=psill.start, "Gau", range=range.start, nugget=nugget.start),
+    fit.method=7
+  )
+  
+  #plot to visually compare
+  plot(SampleVariogram_ordinary, sph.fit, main="sph")
+  plot(SampleVariogram_ordinary, exp.fit, main="exp")
+  plot(SampleVariogram_ordinary, gau.fit, main="gau")
+  
+  # Collect the SSErr values, pick the best (lowest weighted residual sum of squares)
+  sserr <- c(Sph=attr(sph.fit, "SSErr"), Exp=attr(exp.fit, "SSErr"), Gau=attr(gau.fit, "SSErr"))
+  best_model_name <- names(which.min(sserr))
+  message("Auto-selected model: ", best_model_name)
+  vari.model <- list(Sph=sph.fit, Exp=exp.fit, Gau=gau.fit)[[best_model_name]]
+  
+  #Ordinary kriging. Using 12 points at a time. Spatial data needs to be an sf object. 
+  #Point kriging onto the grid, predicts SWE and variance at each cell
+  KrigedEOSSWE <- krige(
+    #SWE ~ DEMValues, # Universal kriging, change to this if there is a trend in SWE with elevation
+    SWE ~ 1, # Ordinary kriging
+    locations = eos_depths_sf,
+    newdata   = sf::st_as_sf(GlacierGrid),
+    model     = vari.model,
+    nmax      = 12
+  )
 
-vari.model <- autofitVariogram(SWE~1,sf::st_as_sf(EndOfSummerDepthsAndEOSS),model="Sph")$var_model
+```
 
-#The actual kriging. Just using 12 points at a time.
-KrigedEOSSWE <- krige(SWE~1,locations=sf::st_as_sf(EndOfSummerDepthsAndEOSS),newdata=sf::st_as_sf(GlacierGrid),model=vari.model,nmax=12)
+Plot accumulation area results
+```{r}
 
+#If there were any non-zero accumulation measurements, krig them
+if (!is.null(EndOfSummerDepths)){
+  #prepare raster for plotting kriged results
+#Note the need to adjust the extent to be 60 m greater than the kriged points, as the kriged points were prepared using the GlacierGrid centres
+  r <- (terra::ext(RollestonGlacierOutline) + 60) %>%
+    terra::rast(resolution = 30, crs = terra::crs(RollestonGlacierOutline))
+  
+#Convert the kriged points to spatial point data, with the projection matching the Rolleston outline  
+  KrigedEOSSWE_v <- terra::vect(KrigedEOSSWE)
+  KrigedEOSSWE_v <- terra::project(KrigedEOSSWE_v, terra::crs(RollestonGlacierOutline))
+  
+  #Convert the points to a raster
+  EOSSWERaster   <- terra::rasterize(KrigedEOSSWE_v, r, field = 'var1.pred')
+  
+  #Resample to 5 m and align with the DEM grid  
+  EOSSWERaster5m<- terra::resample(EOSSWERaster, RollestonDEM)
+  
+  #Restrict to the accumulation area
+  EOSSWERaster5mGlacier <- terra::mask(
+    EOSSWERaster5m,
+    AccumulationAblationAreas[AccumulationAblationAreas[[area_type_col]] == "Accumulation", ]
+    )
 
-#Prepare a raster grid to convert the points to. 
-#Note the need to adjust the extent to be 15 m greater than the kriged points, as the kriged points were prepared using the GlacierGrid centres
-#r <- terra::rast(xmin = 1479467, xmax = 1479947, ymin = 5250212, ymax= 5250722, resolution = 30,crs = terra::crs(KrigedEOSSWE))
-#r <- terra::rast(terra::ext(RollestonGlacierOutline), resolution= 30, crs = terra::crs(KrigedSWE))
-r <- (terra::ext(RollestonGlacierOutline) + 15) %>%
-  terra::rast(resolution= 30, crs = terra::crs(KrigedSWE))
-EOSSWERaster <- terra::rasterize(KrigedEOSSWE,r,field='var1.pred')
-
-#Resample to 5 m and align with the DEM grid
-EOSSWERaster5m <- terra::resample(EOSSWERaster, RollestonDEM)
-
-#Clip to the accumulation area.
-EOSSWERaster5mGlacier <- terra::mask(EOSSWERaster5m,AccumulationAblationAreas[AccumulationAblationAreas$Type=="Accumulation",])
-} else EOSSWERaster5mGlacier <- terr::mask(GlacierDEM - GlacierDEM,AccumulationAblationAreas[AccumulationAblationAreas$Type=="Accumulation",])
+} else {
+  EOSSWERaster5mGlacier <- terr::mask(GlacierDEM - GlacierDEM,AccumulationAblationAreas[AccumulationAblationAreas$Type=="Accumulation",])
+}
 
 #Subtract the summer remaining snow from the end-of-winter snow
 AccumulationAreaMelt <- EOWSWERaster5mGlacier- EOSSWERaster5mGlacier
@@ -509,8 +1001,6 @@ AccumulationAreaMelt <- EOWSWERaster5mGlacier- EOSSWERaster5mGlacier
 paste0("Area averaged summer melt over the accumulation area of ",round(mean(AccumulationAreaMelt[!is.na(AccumulationAreaMelt)]),0), " mm of snow water equivalent")
 
 paste0("Area averaged annual gain over the accumulation area of ",round(mean(EOSSWERaster5mGlacier[!is.na(AccumulationAreaMelt)]),0), " mm of snow water equivalent")
-
-#AccumulationArea <- terra::expanse(AccumulationAblationAreas[AccumulationAblationAreas$Type=="Accumulation",])
 
 paste("Accumulation area size:",round(AccumulationArea/1000000,3),"km2" )
 
@@ -527,7 +1017,87 @@ plot(AccumulationAreaMelt, main = "Accumulation Area Summer Melt")
 plot(AccumulationAblationAreas,add=T)
 }
 ```
+Assess kriging results using leave one out cross validation, same as EOW
+```{r}
+#leave out out cross validation (cv)
+cv <- krige.cv(SWE~1,locations=eos_depths_sf,model=vari.model,nmax=12,debug.level=0)
 
+#plot cv results. dashed line is 1:1 line
+cv_df <- data.frame(
+  observed = cv$observed,
+  predicted = cv$var1.pred
+)
+ggplot(cv_df, aes(x = observed, y = predicted)) +
+  geom_point() +
+  geom_smooth(method = "lm", color = "red", se = FALSE) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  coord_equal() +
+  xlab("Observed SWE") +
+  ylab("Predicted SWE")+ggtitle("Cross validation results EOS")
+```
+
+Uncertainty calculations for accumulation area - same process as EOW
+```{r}
+# Kriging error calculations
+ME <- mean(cv$residual)
+RMSE <- sqrt(mean(cv$residual^2))
+MSDR <- mean((cv$residual^2) / cv$var1.var)
+
+paste0("Mean error: ", sprintf("%.2f", ME), " (mm w.e.)") 
+paste0("Root mean squared error: ", sprintf("%.2f", RMSE), " (mm w.e.)") 
+paste0("Mean squared deviation ratio: ", sprintf("%.2f", MSDR)) 
+
+# Kriging variance raster - masked to the accumulation area
+EOSSWEVarRaster <- terra::rasterize(KrigedEOSSWE_v, r, field = 'var1.var')
+EOSSWEVarRaster5m <- terra::resample(EOSSWEVarRaster, RollestonDEM)
+AccumulationAreaPolygon <- AccumulationAblationAreas[AccumulationAblationAreas[[area_type_col]] == "Accumulation", ]
+EOSSWEVarRaster5mAccum <- terra::mask(EOSSWEVarRaster5m, AccumulationAreaPolygon)
+
+# Convert prediction variance (mm2 w.e.) to kriging standard error (mm w.e., same as SWE) for plotting
+EOSSWESERaster5mAccum   <- sqrt(EOSSWEVarRaster5mAccum)
+
+# Calculate glacier-wide kriging uncertainty
+sigma_EOS_krig    <- sqrt(mean(EOSSWEVarRaster5mAccum[], na.rm = TRUE))
+
+# Plot kriging standard error with probe and EOSS point locations
+{
+plot(EOSSWESERaster5mAccum,
+     main = "EOS Accumlation Area Kriging Standard Error (mm w.e.)",
+     col  = hcl.colors(100, "YlOrRd"),
+     legend = TRUE)
+plot(RollestonGlacierOutline, add = T)
+plot(EndOfSummerDepthsAndEOSS, add=T)
+plot(AccumulationAblationAreas,add=T)
+}
+
+# Root mean square (RMS) kriging standard error over the accumulation area 
+sigma_EOS_krig    <- sqrt(mean(EOSSWEVarRaster5mAccum[], na.rm = TRUE))
+
+# Pixel-level uncertainty (mm we) from assumption of uniform density profile
+sigma_Bs_density_raster <- (EOSSWERaster5mGlacier / EOS_density_mean) * EOS_density_sd_all
+
+# Pixel level uncertainty combined (mm w.e.)
+sigma_Bs_combined <- sqrt(EOSSWEVarRaster5mAccum + sigma_Bs_density_raster^2)
+
+# Accumulation area combined uncertainty 
+sigma_Bs_density <- sqrt(mean(sigma_Bs_density_raster[]^2, na.rm = TRUE))
+sigma_Bs_total <- sqrt(mean(sigma_Bs_combined[]^2, na.rm = TRUE))
+
+paste0("σ kriging: ", sprintf("%.0f", sigma_EOS_krig), " mm w.e.")
+paste0("σ density: ", sprintf("%.0f", sigma_Bs_density), " mm w.e.")
+paste0("σ total (combined): ", sprintf("%.0f", sigma_Bs_total), " mm w.e.")
+
+# Uncertainty contributions
+var_krig_Bs    <- mean(EOSSWEVarRaster5mAccum[],      na.rm = TRUE)
+var_density_Bs <- mean(sigma_Bs_density_raster[]^2,     na.rm = TRUE)
+total_var_Bs   <- var_krig_Bs + var_density_Bs
+
+paste0(sprintf("Kriging uncertainty contribution:  %.1f%%", 100 * var_krig_Bs/total_var_Bs))
+paste0(sprintf("Density uncertainty contribution:  %.1f%%", 100 * var_density_Bs/total_var_Bs))
+
+```
+
+Plot total melt and combine uncertainty rasters
 
 ```{r}
 #Merge the accumulation area melt with the ablation area melt
@@ -548,7 +1118,20 @@ Now plot the whole glacier's summer melt
 plot(TotalGlacierMelt, main = "Summer Melt (mm)")
 plot(RollestonGlacierOutline,add=T)
 }
+
+# Merge accumulation and ablation summer uncertainty into one glacier-wide raster
+SummerUncertainty <- terra::merge(sigma_Bs_combined, sigma_Bs_ablation_combined)
+{
+plot(SummerUncertainty,
+     main = "EOS Standard Deviation (mm w.e.)",
+     col  = hcl.colors(100, "YlOrRd"),
+     legend = TRUE)
+plot(RollestonGlacierOutline, add = T)
+plot(AccumulationAblationAreas,add=T)
+}
 ```
+# Annual balance
+
 And last of all is to plot the annual balance
 ```{r}
 AnnualBalance <- EOWSWERaster5mGlacier - TotalGlacierMelt
@@ -565,15 +1148,46 @@ paste0("Area averaged mass balance change of ",MeanAnnualBalance, " mm of snow w
 ```
 
 ```{r}
-AnnualBalance_stars <- stars::st_as_stars(AnnualBalance)
-mapview(AnnualBalance_stars, na.color = rgb(0, 0, 0, 0, names = NULL, maxColorValue = 1),map.types = c("Esri.WorldShadedRelief", "OpenStreetMap.DE"))
+#Plot annual balance
+# Symmetric colour limits centred on zero
+abs_max <- max(abs(terra::minmax(AnnualBalance)), na.rm = TRUE)
+breaks <- seq(-abs_max, abs_max, length.out = 101)
+
+plot(AnnualBalance, 
+     main = paste("Mass balance (mm),", MassBalanceYear - 1, "-", MassBalanceYear), 
+     col = rev(hcl.colors(100, "Blue-Red 3")),
+     breaks = breaks,
+     type = "continuous")
+plot(RollestonGlacierOutline, add = T)
+plot(EOSSLine, add = T)
+
+```
+Annual balance uncertainty
+```{r}
+# Annual balance uncertainty raster - quadrature sum of winter and summer at each pixel
+AnnualBalanceUncertainty <- sqrt(sigma_bw_combined^2 + SummerUncertainty^2)
+
+# Glacier-wide annual uncertainty - interpolation only - area is applied later
+sigma_Ba_interp <- sqrt(mean(AnnualBalanceUncertainty[]^2, na.rm = TRUE))
+
+# Glacier area/outline uncertainty, applied once at the glacier-wide level (Paul et al., 2013)
+sigma_Ba_area <- MeanAnnualBalance * rel_sigma_area
+
+# Combine interpolation and area uncertainty
+sigma_Ba <- sqrt(sigma_Ba_interp^2 + sigma_Ba_area^2)
+
+paste0("Area averaged mass balance change of ", MeanAnnualBalance, 
+       " ± ", sprintf("%.0f", sigma_Ba), " mm of snow water equivalent")
 
 {
-plot(AnnualBalance, main = "Annual Balance (mm)")
-plot(RollestonGlacierOutline,add=T)
+plot(AnnualBalanceUncertainty,
+     main = "Combined Annual Balance Uncertainty (mm w.e.)",
+     col  = hcl.colors(100, "YlOrRd"),
+     legend = TRUE)
+plot(RollestonGlacierOutline, add = TRUE)
+plot(EOSSLine, add = T)
 }
 ```
-
 
 So I now have stake melt, snow depths, winter balance, summer balance and annual balance.
 I should spit out the numbers in a table ready for WGMS.
