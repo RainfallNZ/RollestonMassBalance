@@ -214,7 +214,7 @@ DEMData <- DEMData[!is.na(DEMData)]
 DEMData <- DEMData[order(DEMData)]
 
 #From the DEM bin all the elevations into equal sized bins
-DEMBins <- split(DEMData, ceiling(seq_along(DEMData)/20))
+DEMBins <- terra::split(DEMData, ceiling(seq_along(DEMData)/20))
 
 #Calculate the area in each bin (same as the number of cells multiplied by the resolution) and the average elevation of each bin
 BinAreas <- sapply(DEMBins, function(x) {length(x) * prod(terra::res(glacier_dem_raster))})
@@ -279,8 +279,8 @@ plot(EOW_depths_sf$DEMValues, EOW_depths_sf$SWE,
 abline(lm(SWE ~ DEMValues, data = EOW_depths_sf))
 
 #fit a trend model, plot the histogram of the residuals
-elev_mod <- lm(SWE ~ DEMValues, data = EOW_depths_sf)
-EOW_depths_sf$resid <- residuals(elev_mod)
+elev_mod <- stats::lm(SWE ~ DEMValues, data = EOW_depths_sf)
+EOW_depths_sf$resid <- stats::residuals(elev_mod)
 hist(EOW_depths_sf$resid)
 ```
 
@@ -288,7 +288,7 @@ Check whether there is any directional trend (i.e. anisotropy).
 This is currently ignored as the later kriging does not (yet) consider anisotropy
 ```{r, eval=FALSE}
 #Check for anisotropy - plot the semivariogram in many directions and see if it changes
-anis_test <- variogram(SWE ~ 1,EOW_depths_sf, cutoff=200, alpha = seq(0, 180, 10),tol.hor = 20)
+anis_test <- gstat::variogram(SWE ~ 1,EOW_depths_sf, cutoff=200, alpha = seq(0, 180, 10),tol.hor = 20)
 plot(anis_test)
 ```
 
@@ -299,15 +299,15 @@ Usually kriging the residuals will have lower semivariance, but maybe not always
 ```{r}
 #Cutoff heuristic - get coordinates, calculate max distance between any two points for variogram cutoff based on https://rpubs.com/Dr_Gurpreet/spatial_interpolation_kriging_R
 coords <- terra::crds(EndOfWinterDepths)
-dists <- dist(coords)
+dists <- stats::dist(coords)
 max_dist <- max(dists)
 cutoff <- max_dist / 2
 
 #generate experimental/sample variogram from residuals after removing elevation trend. 
-EOW_sample_variogram <- variogram(SWE ~ DEMValues,EOW_depths_sf) #, cutoff = cutoff) 
+EOW_sample_variogram <- gstat::variogram(SWE ~ DEMValues,EOW_depths_sf) #, cutoff = cutoff) 
 
 #compare residual variogram to variogram plotted from the data 
-EOW_sample_variogram_ordinary <- variogram(SWE ~ 1, EOW_depths_sf) #, cutoff = cutoff,alpha = 80,tol.hor = 20)
+EOW_sample_variogram_ordinary <- gstat::variogram(SWE ~ 1, EOW_depths_sf) #, cutoff = cutoff,alpha = 80,tol.hor = 20)
 
 #Plot on one graph
 # Set axis limits
@@ -351,27 +351,27 @@ range.start <- max(EOW_sample_variogram$dist)/2
 
 #fitting different models to compare. gaussian unlikely to be any good?
 #fit.variogram only optimises sill/range/nugget, anisotropy values are fixed.
-sph.fit <- fit.variogram(
+sph.fit <- gstat::fit.variogram(
   EOW_sample_variogram,
-  vgm(psill=psill.start, "Sph", range=range.start, nugget=nugget.start),
+  gstat::vgm(psill=psill.start, "Sph", range=range.start, nugget=nugget.start),
   fit.method=7
 )
 
-exp.fit <- fit.variogram(
+exp.fit <- gstat::fit.variogram(
   EOW_sample_variogram,
   vgm(psill=psill.start, "Exp", range=range.start, nugget=nugget.start),
   fit.method=7
 )
 
-gau.fit <- fit.variogram(
+gau.fit <- gstat::fit.variogram(
   EOW_sample_variogram,
-  vgm(psill=psill.start, "Gau", range=range.start, nugget=nugget.start),
+  gstat::vgm(psill=psill.start, "Gau", range=range.start, nugget=nugget.start),
   fit.method=7
 )
 
 lin.fit <- fit.variogram(
   EOW_sample_variogram,
-  vgm(psill=psill.start, "Lin", range=range.start, nugget=nugget.start),
+  gstat::vgm(psill=psill.start, "Lin", range=range.start, nugget=nugget.start),
   fit.method=7
 )
 
@@ -393,7 +393,7 @@ EOW kriging using universal point kriging: predicts SWE and variance at each cel
 
 #Universal kriging. Using 12 points at a time. Spatial data needs to be an sf object. 
 #Point kriging onto the grid, predicts SWE and variance at each cell
-EOW_krige_result <- krige(SWE~DEMValues,locations=EOW_depths_sf,newdata=sf::st_as_sf(glacier_grid),model=EOW_vari_model, nmax=12)
+EOW_krige_result <- gstat::krige(SWE~DEMValues,locations=EOW_depths_sf,newdata=sf::st_as_sf(glacier_grid),model=EOW_vari_model, nmax=12)
 
 #Ordinary kriging - uncomment the following line
 #KrigedSWE <- krige(SWE~1,locations=EOW_depths_sf,newdata=sf::st_as_sf(GlacierGrid),model=EOW_vari_model, nmax=12)
@@ -428,7 +428,7 @@ For realisation 1:
 # Conditional simulations of the SWE surface: produces 1000 versions of simulated
 # values for each grid point point within the glacier area
 #Each version
-EOW_sim <- krige(
+EOW_sim <- gstat::krige(
   SWE ~ DEMValues,
   locations = EOW_depths_sf,
   newdata = sf::st_as_sf(glacier_grid),
@@ -441,8 +441,8 @@ EOW_sim_df <- sf::st_drop_geometry(EOW_sim)
 EOW_sim_mean <- colMeans(EOW_sim_df)
 
 # Obtain standard deviation and 95% confidence interval
-sigma_Bw_kriging <- sd(EOW_sim_mean)
-EOW_accumulation_ci <- quantile(EOW_sim_mean, c(0.025, 0.975))
+sigma_Bw_kriging <- stats::sd(EOW_sim_mean)
+EOW_accumulation_ci <- stats::quantile(EOW_sim_mean, c(0.025, 0.975))
 
 cat("\nEOW kriging SE =", sprintf("%.0f", sigma_Bw_kriging), "mm w.e.\n")
 cat("95% confidence interval =", sprintf("%.0f", EOW_accumulation_ci[1]), "to", sprintf("%.0f", EOW_accumulation_ci[2]), "mm w.e.\n")
@@ -646,7 +646,7 @@ DEM_df <- data.frame(elevation = terra::values(glacier_dem_raster, na.rm = FALSE
 names(DEM_df) <- "elevation"
 
 # Feed every elevation through the melt elevation linear model and get standard error of the predicted mean melt for every elevation
-Predictions <- predict(MeltElevationModel, newdata = DEM_df, se.fit = TRUE)
+Predictions <- stats::predict(MeltElevationModel, newdata = DEM_df, se.fit = TRUE)
 
 # Build standard error raster matching the DEM grid, mask to the ablation area
 MeltSERaster <- glacier_dem_raster
@@ -742,8 +742,8 @@ if (eos_no_data) stop("No data year — do not run this chunk.")
 EOSSSampleSize <- floor(terra::perim(EOSSLine)/20)
 
 EOSSSample <- sf::st_as_sf(EOSSLine) %>%
-  st_cast(to="LINESTRING",warn=FALSE) %>%
-  st_line_sample(n = EOSSSampleSize, type = "regular") %>%
+  sf::st_cast(to="LINESTRING",warn=FALSE) %>%
+  sf::st_line_sample(n = EOSSSampleSize, type = "regular") %>%
   terra::vect() %>%
   terra::disagg()
 EOSSSample$SWE <- 0
@@ -801,8 +801,8 @@ if (!eos_no_data){
   abline(lm(SWE ~ DEMValues, data = eos_depths_sf))
   
   #fit a trend model, plot the histogram of the residuals
-  elev_mod <- lm(SWE ~ DEMValues, data = eos_depths_sf)
-  eos_depths_sf$resid <- residuals(elev_mod)
+  elev_mod <- stats::lm(SWE ~ DEMValues, data = eos_depths_sf)
+  eos_depths_sf$resid <- stats::residuals(elev_mod)
   hist(eos_depths_sf$resid)
 }
 ```
@@ -915,9 +915,9 @@ if (!eos_no_data) {
     
     EOS_models <- list()
     for (m in c("Sph", "Exp", "Gau", "Lin")) {
-      EOS_models[[m]] <- fit.variogram(
+      EOS_models[[m]] <- gstat::fit.variogram(
         EOS_sample_variogram_ordinary,
-        vgm(psill = EOS_psill_start, m, range = EOS_range_start, nugget = EOS_nugget_start),
+        gstat::vgm(psill = EOS_psill_start, m, range = EOS_range_start, nugget = EOS_nugget_start),
         fit.method = 7
       )
       print(plot(EOS_sample_variogram_ordinary, EOS_models[[m]], main = m))
@@ -940,7 +940,7 @@ if (!eos_no_data) {
 
 # Universal kriging for EOS
 if (EOS_universal_kriging == TRUE) {
-  EOS_krige_result <- krige(
+  EOS_krige_result <- gstat::krige(
   SWE ~ DEMValues,       ### Universal kriging
   locations = eos_depths_sf,
   newdata   = sf::st_as_sf(glacier_grid),
@@ -948,7 +948,7 @@ if (EOS_universal_kriging == TRUE) {
   nmax      = 12
 )
 } else { # ordinary kriging
-EOS_krige_result <- krige(
+EOS_krige_result <- gstat::krige(
   SWE ~ 1, ### Ordinary kriging
   locations = eos_depths_sf,
   newdata   = sf::st_as_sf(glacier_grid),
@@ -970,7 +970,7 @@ Conditional gaussian simulations to calculate kriging standard deviation
 if (!eos_no_data) {
 # Conditional simulations of the SWE surface
 if (EOS_universal_kriging == TRUE) {
-  EOS_sim <- krige(
+  EOS_sim <- gstat::krige(
   SWE ~ DEMValues,       ### Universal kriging
   locations = eos_depths_sf,
   newdata = sf::st_as_sf(glacier_grid),
@@ -978,7 +978,7 @@ if (EOS_universal_kriging == TRUE) {
   nmax = 12,
   nsim = 1000)
 } else {
-  EOS_sim <- krige(
+  EOS_sim <- gstat::krige(
   SWE ~ 1,
   locations = eos_depths_sf,
   newdata = sf::st_as_sf(glacier_grid),
